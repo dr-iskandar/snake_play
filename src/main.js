@@ -6,8 +6,8 @@ const ROWS = 50;
 const WORLD_W = COLS * TILE;
 const WORLD_H = ROWS * TILE;
 const SESSION_MS = 120000;
-const PLAYER_STEP_MS = 185;
-const BOT_STEP_MS = 215;
+const PLAYER_STEP_MS = 145;
+const BOT_STEP_MS = 175;
 const COMBO_WINDOW_MS = 10000; // prototype tuning; GDD only states "nearby time"
 
 const FRAME = {
@@ -47,6 +47,13 @@ class GameScene extends Phaser.Scene {
       frameHeight: 96,
       endFrame: 15
     });
+
+    // Reference-style assets: low-poly rocks, wooden fences, glossy rewards.
+    this.load.svg('obstacleRock', './assets/obstacle-rock.svg');
+    this.load.svg('obstacleFence', './assets/obstacle-fence.svg');
+    this.load.svg('apple', './assets/item-apple.svg');
+    this.load.svg('star', './assets/item-star.svg');
+    this.load.svg('blackbox', './assets/item-mystery.svg');
   }
 
   create() {
@@ -75,7 +82,7 @@ class GameScene extends Phaser.Scene {
     this.configureCamera();
 
     this.spawnApple();
-    this.time.delayedCall(4500, () => this.spawnBlackBox());
+    this.time.delayedCall(3000, () => this.spawnBlackBox());
   }
 
   makeItemTextures() {
@@ -122,35 +129,60 @@ class GameScene extends Phaser.Scene {
 
   buildWorld() {
     this.walls = new Set();
-    const addWallH = (x, y, length) => { for (let i = 0; i < length; i++) this.walls.add(tileKey(x + i, y)); };
-    const addWallV = (x, y, length) => { for (let i = 0; i < length; i++) this.walls.add(tileKey(x, y + i)); };
+    this.wallSegments = [];
 
-    // Map variant: large 60x50 world with internal walls. Edge is also a collision boundary.
-    addWallH(6, 7, 10); addWallV(16, 7, 8);
-    addWallV(33, 5, 12); addWallH(34, 17, 11);
-    addWallH(8, 24, 13); addWallV(21, 20, 9);
-    addWallV(43, 23, 12); addWallH(35, 35, 9);
-    addWallH(11, 40, 14); addWallV(27, 34, 9);
-    addWallV(52, 8, 10); addWallH(47, 18, 6);
+    const addSegment = (x, y, length, axis = 'h', kind = 'rock') => {
+      this.wallSegments.push({ x, y, length, axis, kind });
+      for (let i = 0; i < length; i++) {
+        const tx = axis === 'h' ? x + i : x;
+        const ty = axis === 'v' ? y + i : y;
+        this.walls.add(tileKey(tx, ty));
+      }
+    };
+
+    // Sparse obstacle course inspired by the provided floor-plan reference.
+    addSegment(5, 6, 5, 'h', 'rock');
+    addSegment(13, 7, 3, 'h', 'fence');
+    addSegment(19, 5, 4, 'v', 'rock');
+    addSegment(25, 10, 6, 'h', 'rock');
+    addSegment(34, 7, 3, 'v', 'fence');
+    addSegment(43, 6, 4, 'v', 'rock');
+    addSegment(49, 12, 5, 'h', 'rock');
+    addSegment(8, 18, 3, 'h', 'fence');
+    addSegment(15, 20, 4, 'v', 'rock');
+    addSegment(22, 24, 5, 'h', 'rock');
+    addSegment(31, 23, 3, 'h', 'fence');
+    addSegment(38, 20, 4, 'v', 'rock');
+    addSegment(45, 28, 6, 'h', 'rock');
+    addSegment(20, 35, 5, 'h', 'rock');
+    addSegment(26, 33, 2, 'h', 'fence');
+    addSegment(35, 34, 4, 'v', 'rock');
+    addSegment(33, 42, 3, 'h', 'fence');
+    addSegment(23, 45, 5, 'h', 'rock');
+    addSegment(18, 38, 3, 'v', 'rock');
+    addSegment(48, 41, 4, 'h', 'fence');
 
     this.bg = this.add.graphics().setDepth(-30);
     for (let y = 0; y < ROWS; y++) {
       for (let x = 0; x < COLS; x++) {
-        this.bg.fillStyle((x + y) % 2 ? 0xdbe9c5 : 0xe9f0d2, 1);
+        this.bg.fillStyle((x + y) % 2 ? 0xc4dbb5 : 0xe3d8b7, 1);
         this.bg.fillRect(x * TILE, y * TILE, TILE, TILE);
       }
     }
-    this.bg.lineStyle(1.5, 0xb9ce96, 0.55);
+    this.bg.lineStyle(2, 0x8ead66, 0.6);
     for (let x = 0; x <= COLS; x++) this.bg.lineBetween(x * TILE, 0, x * TILE, WORLD_H);
     for (let y = 0; y <= ROWS; y++) this.bg.lineBetween(0, y * TILE, WORLD_W, y * TILE);
 
-    this.wallGfx = this.add.graphics().setDepth(-8);
-    this.walls.forEach((k) => {
-      const [x, y] = k.split(',').map(Number);
-      const px = x * TILE + 6, py = y * TILE + 9;
-      this.wallGfx.fillStyle(0x000000, 0.11).fillRoundedRect(px + 5, py + 6, TILE - 12, TILE - 18, 14);
-      this.wallGfx.fillStyle(0x8c806c, 1).fillRoundedRect(px, py, TILE - 12, TILE - 18, 14);
-      this.wallGfx.lineStyle(3, 0x665d4f, 0.78).strokeRoundedRect(px, py, TILE - 12, TILE - 18, 14);
+    this.obstacleSprites = [];
+    this.wallSegments.forEach(seg => {
+      const cx = (seg.x + (seg.axis === 'h' ? seg.length / 2 : 0.5)) * TILE;
+      const cy = (seg.y + (seg.axis === 'v' ? seg.length / 2 : 0.5)) * TILE;
+      const key = seg.kind === 'fence' ? 'obstacleFence' : 'obstacleRock';
+      const sprite = this.add.image(cx, cy, key).setDepth(-8);
+      const thickness = seg.kind === 'fence' ? TILE * 0.78 : TILE * 0.92;
+      sprite.setDisplaySize(seg.length * TILE, thickness);
+      if (seg.axis === 'v') sprite.setRotation(Math.PI / 2);
+      this.obstacleSprites.push(sprite);
     });
   }
 
@@ -411,23 +443,39 @@ class GameScene extends Phaser.Scene {
 
   renderSnake(snake, t, time = this.time.now) {
     const visibleAlpha = time < snake.invisibleUntil ? 0.36 : 1;
+    const ease = Phaser.Math.Easing.Sine.InOut(Phaser.Math.Clamp(t, 0, 1));
+
     snake.sprites.forEach((sprite, i) => {
       const from = snake.prevPositions[Math.min(i, snake.prevPositions.length - 1)] || snake.positions[i];
       const to = snake.positions[i] || from;
       const a = centerOf(from), b = centerOf(to);
-      sprite.setPosition(Phaser.Math.Linear(a.x, b.x, t), Phaser.Math.Linear(a.y, b.y, t));
+      sprite.setPosition(Phaser.Math.Linear(a.x, b.x, ease), Phaser.Math.Linear(a.y, b.y, ease));
       sprite.setAlpha(this.quiz && snake.isPlayer ? 0 : visibleAlpha);
+    });
 
-      if (i === 0) sprite.setRotation(headRotation(snake.dir));
-      else if (i === snake.positions.length - 1) {
-        const prev = snake.positions[Math.max(0, i - 1)];
-        sprite.setRotation(tailRotation({ x: to.x - prev.x, y: to.y - prev.y }));
+    // Calculate rotation from the actually rendered chain, not from the next logical tick.
+    // This removes the "late tail" / snapping feeling when turning several times quickly.
+    snake.sprites.forEach((sprite, i) => {
+      let targetRotation = sprite.rotation;
+      if (i === 0) {
+        targetRotation = headRotation(snake.dir);
+      } else if (i === snake.sprites.length - 1) {
+        const prev = snake.sprites[Math.max(0, i - 1)];
+        targetRotation = tailRotation({ x: sprite.x - prev.x, y: sprite.y - prev.y });
       } else {
-        const prev = snake.positions[i - 1], next = snake.positions[i + 1];
-        const d = { x: next.x - prev.x, y: next.y - prev.y };
-        sprite.setRotation(Math.atan2(d.y, d.x) + Math.PI / 2);
+        const prev = snake.sprites[i - 1], next = snake.sprites[i + 1];
+        targetRotation = Math.atan2(next.y - prev.y, next.x - prev.x) + Math.PI / 2;
       }
-      if (i === 0 && time < snake.spikeUntil) sprite.setTint(0xffef7a); else sprite.clearTint();
+
+      if (!sprite.getData('rotationReady')) {
+        sprite.setRotation(targetRotation);
+        sprite.setData('rotationReady', true);
+      } else {
+        sprite.setRotation(Phaser.Math.Angle.RotateTo(sprite.rotation, targetRotation, 0.20));
+      }
+
+      if (i === 0 && time < snake.spikeUntil) sprite.setTint(0xffef7a);
+      else sprite.clearTint();
     });
   }
 
@@ -478,7 +526,7 @@ class GameScene extends Phaser.Scene {
   startStarRush(time) {
     this.starRushUntil = time + 30000;
     this.clearStars();
-    for (let i = 0; i < 25; i++) this.spawnStar();
+    for (let i = 0; i < 25; i++) this.spawnStar(i < 8 ? this.randomFreeTileNearPlayer(2, 8, false) : null);
     this.flash('STAR RUSH! 25 stars · 30s', 1800);
     this.cameras.main.flash(220, 255, 226, 92, false);
   }
@@ -491,7 +539,9 @@ class GameScene extends Phaser.Scene {
 
   spawnApple() {
     if (this.apple || this.gameOver) return;
-    this.apple = this.spawnItem('apple');
+    // Keep the core reward inside the player's current play space.
+    this.apple = this.spawnItem('apple', this.randomFreeTileNearPlayer(3, 6, true));
+    this.flash('🍎 Apple nearby', 650);
     this.apple.expireEvent = this.time.delayedCall(5000, () => {
       if (!this.apple) return;
       this.destroyItem(this.apple); this.apple = null;
@@ -500,26 +550,37 @@ class GameScene extends Phaser.Scene {
   }
 
   spawnBlackBox() {
-    if (this.blackBox || this.gameOver) return;
+    if (this.blackBox || this.gameOver || this.quiz) return;
     this.lastBlackBoxSpawn = this.time.now;
-    this.blackBox = this.spawnItem('blackbox');
+    // Prefer directly in front of the player so the quiz is discoverable, not lost in a 60x50 world.
+    this.blackBox = this.spawnItem('blackbox', this.randomFreeTileNearPlayer(4, 7, true));
+    this.flash('❓ Mystery Box nearby — enter it for Quiz', 1350);
     const target = this.blackBox;
-    target.expireEvent = this.time.delayedCall(4000, () => {
+    target.expireEvent = this.time.delayedCall(8000, () => {
       if (this.blackBox !== target) return;
       this.destroyItem(target); this.blackBox = null;
     });
   }
 
-  spawnStar() { this.stars.push(this.spawnItem('star')); }
+  spawnStar(tile = null) { this.stars.push(this.spawnItem('star', tile)); }
 
-  spawnItem(type) {
-    const tile = this.randomFreeTile();
+  spawnItem(type, tileOverride = null) {
+    const tile = tileOverride || this.randomFreeTile();
     const c = centerOf(tile);
     const sprite = this.add.sprite(c.x, c.y, type).setDepth(8);
-    if (type === 'star') this.tweens.add({ targets: sprite, angle: 360, duration: 1500, repeat: -1 });
+
+    if (type === 'apple') sprite.setDisplaySize(54, 54);
+    if (type === 'star') {
+      sprite.setDisplaySize(62, 62);
+      this.tweens.add({ targets: sprite, angle: 360, duration: 1500, repeat: -1 });
+    }
     if (type === 'blackbox') {
-      this.tweens.add({ targets: sprite, scale: 1.12, duration: 520, yoyo: true, repeat: -1 });
-      const q = this.add.text(c.x, c.y - 2, '?', { fontFamily: 'system-ui', fontSize: '28px', fontStyle: '900', color: '#fff' }).setOrigin(0.5).setDepth(9);
+      sprite.setDisplaySize(68, 68);
+      this.tweens.add({ targets: sprite, scale: 1.10, duration: 520, yoyo: true, repeat: -1 });
+      const q = this.add.text(c.x, c.y + 43, 'QUIZ', {
+        fontFamily: 'system-ui', fontSize: '10px', fontStyle: '900', color: '#ffffff',
+        backgroundColor: '#151823cc', padding: { x: 6, y: 3 }
+      }).setOrigin(0.5).setDepth(9);
       return { type, tile, sprite, label: q };
     }
     return { type, tile, sprite };
@@ -536,14 +597,52 @@ class GameScene extends Phaser.Scene {
   randomFreeTile() {
     for (let i = 0; i < 250; i++) {
       const tile = { x: Phaser.Math.Between(2, COLS - 3), y: Phaser.Math.Between(2, ROWS - 3) };
-      if (this.walls.has(tileKey(tile.x, tile.y))) continue;
-      if (this.snakes?.some(s => s.positions.some(p => sameTile(p, tile)))) continue;
-      if (this.apple && sameTile(this.apple.tile, tile)) continue;
-      if (this.blackBox && sameTile(this.blackBox.tile, tile)) continue;
-      if (this.stars?.some(s => sameTile(s.tile, tile))) continue;
+      if (this.isTileOccupied(tile)) continue;
       return tile;
     }
     return { x: 30, y: 20 };
+  }
+
+  isTileOccupied(tile) {
+    if (tile.x < 1 || tile.y < 1 || tile.x >= COLS - 1 || tile.y >= ROWS - 1) return true;
+    if (this.walls.has(tileKey(tile.x, tile.y))) return true;
+    if (this.snakes?.some(s => s.positions.some(p => sameTile(p, tile)))) return true;
+    if (this.apple && sameTile(this.apple.tile, tile)) return true;
+    if (this.blackBox && sameTile(this.blackBox.tile, tile)) return true;
+    if (this.stars?.some(s => sameTile(s.tile, tile))) return true;
+    return false;
+  }
+
+  pathClear(from, to) {
+    const dx = Math.sign(to.x - from.x), dy = Math.sign(to.y - from.y);
+    let x = from.x, y = from.y;
+    while (x !== to.x || y !== to.y) {
+      x += dx; y += dy;
+      if (this.walls.has(tileKey(x, y))) return false;
+    }
+    return true;
+  }
+
+  randomFreeTileNearPlayer(minDistance = 3, maxDistance = 7, preferAhead = false) {
+    const head = this.player?.positions?.[0];
+    if (!head) return this.randomFreeTile();
+
+    if (preferAhead) {
+      for (let d = minDistance; d <= maxDistance; d++) {
+        const tile = { x: head.x + this.player.dir.x * d, y: head.y + this.player.dir.y * d };
+        if (!this.isTileOccupied(tile) && this.pathClear(head, tile)) return tile;
+      }
+    }
+
+    for (let i = 0; i < 100; i++) {
+      const dx = Phaser.Math.Between(-maxDistance, maxDistance);
+      const dy = Phaser.Math.Between(-maxDistance, maxDistance);
+      const dist = Math.abs(dx) + Math.abs(dy);
+      if (dist < minDistance || dist > maxDistance) continue;
+      const tile = { x: head.x + dx, y: head.y + dy };
+      if (!this.isTileOccupied(tile)) return tile;
+    }
+    return this.randomFreeTile();
   }
 
   startQuiz(time) {
