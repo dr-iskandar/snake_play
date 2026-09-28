@@ -6,9 +6,10 @@ const ROWS = 50;
 const WORLD_W = COLS * TILE;
 const WORLD_H = ROWS * TILE;
 const SESSION_MS = 120000;
-const PLAYER_STEP_MS = 145;
-const BOT_STEP_MS = 175;
+const PLAYER_STEP_MS = 180;
+const BOT_STEP_MS = 195;
 const COMBO_WINDOW_MS = 10000; // prototype tuning; GDD only states "nearby time"
+const STAR_SPAWN_MODE = 'viewport'; // easy to switch to 'world' later
 
 const FRAME = {
   beige: { body: 0, head: 1, tail: 2 },
@@ -66,6 +67,9 @@ class GameScene extends Phaser.Scene {
     this.starRushUntil = 0;
     this.quiz = null;
     this.activeSkillLabel = '';
+    this.pendingSkill = null;
+    this.pendingSkillExpiresAt = 0;
+    this.pendingSkillOrigin = null;
     this.lastBlackBoxSpawn = this.time.now;
     this.blackBox = null;
     this.apple = null;
@@ -199,7 +203,8 @@ class GameScene extends Phaser.Scene {
       name, skin, positions: positions.map(p => ({ ...p })), prevPositions: positions.map(p => ({ ...p })),
       dir: { ...dir }, queuedDir: { ...dir }, isPlayer: player, score: 0, elapsed: 0,
       stepMs: player ? PLAYER_STEP_MS : BOT_STEP_MS, sprites: [], stunnedUntil: 0,
-      slowedUntil: 0, invisibleUntil: 0, spikeUntil: 0, venomUntil: 0
+      slowedUntil: 0, invisibleUntil: 0, spikeUntil: 0, venomUntil: 0,
+      collisionCooldownUntil: 0, ghostUntil: 0
     };
     this.syncSnakeSprites(snake);
     return snake;
@@ -248,6 +253,14 @@ class GameScene extends Phaser.Scene {
     }).setOrigin(1, 0).setScrollFactor(0).setDepth(202).setInteractive({ useHandCursor: true });
     this.skinButton.on('pointerdown', () => this.cycleSkin());
 
+    this.skillButton = this.add.text(GAME_W - 18, GAME_H - 80, 'USE SKILL', {
+      fontFamily: 'system-ui', fontSize: '13px', fontStyle: '900', color: '#111827',
+      backgroundColor: '#ffd166', padding: { x: 16, y: 11 }
+    }).setOrigin(1, 1).setScrollFactor(0).setDepth(210).setInteractive({ useHandCursor: true }).setVisible(false);
+    this.skillButton.on('pointerdown', () => {
+      if (this.pendingSkill && !this.quiz && !this.gameOver) this.usePendingSkill();
+    });
+
     this.toast = this.add.text(GAME_W / 2, 132, 'Swipe to turn', {
       fontFamily: 'system-ui', fontSize: '13px', color: '#fff', backgroundColor: '#111827cc', padding: { x: 13, y: 8 }
     }).setOrigin(0.5).setScrollFactor(0).setDepth(205);
@@ -292,16 +305,23 @@ class GameScene extends Phaser.Scene {
     this.input.on('pointerdown', p => {
       if (this.gameOver || this.quiz) return;
       if (this.skinButton.getBounds().contains(p.x, p.y)) return;
+      if (this.skillButton?.visible && this.skillButton.getBounds().contains(p.x, p.y)) return;
       this.swipeStart = { x: p.x, y: p.y };
     });
     this.input.on('pointermove', p => {
       if (!p.isDown || !this.swipeStart || this.quiz || this.gameOver) return;
       const dx = p.x - this.swipeStart.x, dy = p.y - this.swipeStart.y;
-      if (Math.hypot(dx, dy) < 28) return;
+      if (Math.hypot(dx, dy) < 12) return;
       this.queueSwipe(dx, dy);
       this.swipeStart = { x: p.x, y: p.y };
     });
-    this.input.on('pointerup', () => { this.swipeStart = null; });
+    this.input.on('pointerup', p => {
+      if (this.swipeStart && !this.quiz && !this.gameOver) {
+        const dx = p.x - this.swipeStart.x, dy = p.y - this.swipeStart.y;
+        if (Math.hypot(dx, dy) >= 10) this.queueSwipe(dx, dy);
+      }
+      this.swipeStart = null;
+    });
   }
 
   queueSwipe(dx, dy) {
@@ -310,7 +330,12 @@ class GameScene extends Phaser.Scene {
   }
 
   queueDirection(snake, dir) {
-    if (!opposite(dir, snake.dir)) snake.queuedDir = { x: dir.x, y: dir.y };
+    if (opposite(dir, snake.dir)) return;
+    const changed = dir.x !== snake.queuedDir.x || dir.y !== snake.queuedDir.y;
+    snake.queuedDir = { x: dir.x, y: dir.y };
+
+    // Keep the slower overall pace, but make a requested turn happen quickly.
+    if (changed && snake.isPlayer) snake.elapsed = Math.max(snake.elapsed, snake.stepMs * 0.80);
   }
 
   configureCamera() {
@@ -324,6 +349,7 @@ class GameScene extends Phaser.Scene {
 
     this.readKeyboard();
     this.updateQuiz(time);
+    this.updatePendingSkill(time);
     this.updateSpawns(time);
     this.updatePoison(time);
 
@@ -356,16 +382,23 @@ class GameScene extends Phaser.Scene {
   stepSnake(snake, time) {
     snake.dir = { ...snake.queuedDir };
     const head = snake.positions[0];
-    const next = { x: head.x + snake.dir.x, y: head.y + snake.dir.y };
+    const rawNext = { x: head.x + snake.dir.x, y: head.y + snake.dir.y };
+    const next = {
+      x: (rawNext.x + COLS) % COLS,
+      y: (rawNext.y + ROWS) % ROWS
+    };
+    const wrapped = rawNext.x !== next.x || rawNext.y !== next.y;
 
-    const hitWorld = next.x < 0 || next.y < 0 || next.x >= COLS || next.y >= ROWS || this.walls.has(tileKey(next.x, next.y));
+    const hitObstacle = this.walls.has(tileKey(next.x, next.y));
     const hitSelf = snake.positions.slice(1, -1).some(p => sameTile(p, next));
-    const hitOther = this.snakes.find(s => s !== snake && s.positions.some(p => sameTile(p, next)));
+    const hitOther = time >= snake.ghostUntil
+      ? this.snakes.find(s => s !== snake && s.positions.some(p => sameTile(p, next)))
+      : null;
 
-    if (hitWorld || hitSelf || hitOther) {
+    if (hitObstacle || hitSelf || hitOther) {
       if (hitOther && time < snake.spikeUntil) this.damageSnake(hitOther, 1, true);
       if (hitOther && time < hitOther.spikeUntil) this.damageSnake(snake, 1, true);
-      this.handleCollision(snake);
+      this.handleCollision(snake, time, hitOther, hitObstacle || hitSelf);
       return;
     }
 
@@ -373,6 +406,9 @@ class GameScene extends Phaser.Scene {
     snake.prevPositions = old;
     snake.positions.unshift(next);
     snake.positions.pop();
+
+    // Avoid tweening across the full 60-tile map when wrapping to the opposite edge.
+    if (wrapped) snake.prevPositions[0] = { ...next };
 
     if (snake.isPlayer && time < snake.venomUntil) this.addPoison(old[old.length - 1], time);
     if (!snake.isPlayer && this.isPoison(next)) {
@@ -384,13 +420,27 @@ class GameScene extends Phaser.Scene {
     this.syncSnakeSprites(snake);
   }
 
-  handleCollision(snake) {
-    this.damageSnake(snake, 1, false);
-    const options = DIRS.filter(d => !opposite(d, snake.dir) && this.isSafeNext(snake, d));
-    if (options.length) snake.queuedDir = { ...Phaser.Utils.Array.GetRandom(options) };
+  handleCollision(snake, time, hitOther = null, hitSolid = false) {
+    // One collision = at most one tail loss. A short ghost/grace window lets a trapped snake escape,
+    // instead of both snakes repeatedly shrinking while heads are boxed in.
+    if (time >= snake.collisionCooldownUntil) {
+      this.damageSnake(snake, 1, false);
+      snake.collisionCooldownUntil = time + 850;
+    }
+
+    const options = DIRS.filter(d => !opposite(d, snake.dir) && this.isSafeNext(snake, d, true));
+    if (options.length) {
+      const chosen = Phaser.Utils.Array.GetRandom(options);
+      snake.queuedDir = { ...chosen };
+      snake.dir = { ...chosen };
+    }
+
+    if (hitOther || !options.length) snake.ghostUntil = Math.max(snake.ghostUntil, time + 750);
+    snake.stunnedUntil = Math.max(snake.stunnedUntil, time + (hitSolid ? 120 : 80));
+
     if (snake.isPlayer) {
-      this.cameras.main.shake(130, 0.008);
-      this.flash('BUMP! -1 tail');
+      this.cameras.main.shake(90, 0.006);
+      this.flash(hitOther ? 'BUMP! -1 tail · escape grace' : 'Obstacle! -1 tail');
     }
   }
 
@@ -406,10 +456,15 @@ class GameScene extends Phaser.Scene {
     if (bounce) snake.stunnedUntil = this.time.now + 700;
   }
 
-  isSafeNext(snake, dir) {
-    const h = snake.positions[0], n = { x: h.x + dir.x, y: h.y + dir.y };
-    if (n.x < 0 || n.y < 0 || n.x >= COLS || n.y >= ROWS || this.walls.has(tileKey(n.x, n.y))) return false;
-    return !snake.positions.slice(1, -1).some(p => sameTile(p, n));
+  isSafeNext(snake, dir, avoidOtherSnakes = false) {
+    const h = snake.positions[0];
+    const raw = { x: h.x + dir.x, y: h.y + dir.y };
+    const n = { x: (raw.x + COLS) % COLS, y: (raw.y + ROWS) % ROWS };
+
+    if (this.walls.has(tileKey(n.x, n.y))) return false;
+    if (snake.positions.slice(1, -1).some(p => sameTile(p, n))) return false;
+    if (avoidOtherSnakes && this.snakes.some(s => s !== snake && s.positions.some(p => sameTile(p, n)))) return false;
+    return true;
   }
 
   chooseBotDirection(snake) {
@@ -449,7 +504,12 @@ class GameScene extends Phaser.Scene {
       const from = snake.prevPositions[Math.min(i, snake.prevPositions.length - 1)] || snake.positions[i];
       const to = snake.positions[i] || from;
       const a = centerOf(from), b = centerOf(to);
-      sprite.setPosition(Phaser.Math.Linear(a.x, b.x, ease), Phaser.Math.Linear(a.y, b.y, ease));
+      const wrappedX = Math.abs(a.x - b.x) > WORLD_W / 2;
+      const wrappedY = Math.abs(a.y - b.y) > WORLD_H / 2;
+      sprite.setPosition(
+        wrappedX ? b.x : Phaser.Math.Linear(a.x, b.x, ease),
+        wrappedY ? b.y : Phaser.Math.Linear(a.y, b.y, ease)
+      );
       sprite.setAlpha(this.quiz && snake.isPlayer ? 0 : visibleAlpha);
     });
 
@@ -526,8 +586,13 @@ class GameScene extends Phaser.Scene {
   startStarRush(time) {
     this.starRushUntil = time + 30000;
     this.clearStars();
-    for (let i = 0; i < 25; i++) this.spawnStar(i < 8 ? this.randomFreeTileNearPlayer(2, 8, false) : null);
-    this.flash('STAR RUSH! 25 stars · 30s', 1800);
+
+    for (let i = 0; i < 25; i++) {
+      const tile = STAR_SPAWN_MODE === 'viewport' ? this.randomFreeTileInViewport() : null;
+      this.spawnStar(tile);
+    }
+
+    this.flash('STAR RUSH! 25 stars · full screen · 30s', 1800);
     this.cameras.main.flash(220, 255, 226, 92, false);
   }
 
@@ -645,6 +710,24 @@ class GameScene extends Phaser.Scene {
     return this.randomFreeTile();
   }
 
+  randomFreeTileInViewport() {
+    const head = this.player.positions[0];
+    const zoom = Math.max(0.68, this.cameras.main.zoom || 1);
+    const halfCols = Math.max(3, Math.floor((GAME_W / zoom) / TILE / 2));
+    const halfRows = Math.max(5, Math.floor((GAME_H / zoom) / TILE / 2));
+
+    for (let i = 0; i < 160; i++) {
+      const dx = Phaser.Math.Between(-halfCols, halfCols);
+      const dy = Phaser.Math.Between(-halfRows, halfRows);
+      const tile = {
+        x: (head.x + dx + COLS) % COLS,
+        y: (head.y + dy + ROWS) % ROWS
+      };
+      if (!this.isTileOccupied(tile)) return tile;
+    }
+    return this.randomFreeTileNearPlayer(2, 8, false);
+  }
+
   startQuiz(time) {
     const q = Phaser.Utils.Array.GetRandom(QUIZ_BANK);
     this.quiz = { ...q, startedAt: time, endsAt: time + 15000 };
@@ -672,46 +755,114 @@ class GameScene extends Phaser.Scene {
     this.quizUI.forEach(x => x.setVisible(false));
     this.quizOrb.setVisible(false);
     this.player.invisibleUntil = time + 8000;
+
     if (correct) {
       const skill = Phaser.Utils.Array.GetRandom(SKILLS);
-      this.activateSkill(this.player, skill, time);
-      this.flash(`${skill}! 8s power-up`, 1700);
-    } else this.flash(timedOut ? 'Quiz time out · no power-up' : 'Wrong answer · no power-up', 1600);
+      this.pendingSkill = skill;
+      this.pendingSkillExpiresAt = time + 8000;
+      this.pendingSkillOrigin = { ...this.player.positions[0] };
+      this.activeSkillLabel = `READY: ${skill.toUpperCase()}`;
+      this.skillButton.setText(`USE ${skill.toUpperCase()}`).setVisible(true);
+      this.flash(`${skill} ready · aim then tap USE`, 1800);
+    } else {
+      this.pendingSkill = null;
+      this.pendingSkillExpiresAt = 0;
+      this.pendingSkillOrigin = null;
+      this.skillButton.setVisible(false);
+      this.flash(timedOut ? 'Quiz time out · no power-up' : 'Wrong answer · no power-up', 1600);
+    }
   }
 
-  activateSkill(snake, skill, time) {
+  updatePendingSkill(time) {
+    if (!this.pendingSkill) return;
+    if (time < this.pendingSkillExpiresAt) return;
+    this.flash(`${this.pendingSkill} expired`, 900);
+    this.pendingSkill = null;
+    this.pendingSkillExpiresAt = 0;
+    this.pendingSkillOrigin = null;
+    this.activeSkillLabel = '';
+    this.skillButton.setVisible(false);
+  }
+
+  usePendingSkill() {
+    if (!this.pendingSkill) return;
+    const skill = this.pendingSkill;
+    const origin = this.pendingSkillOrigin ? { ...this.pendingSkillOrigin } : { ...this.player.positions[0] };
+    this.pendingSkill = null;
+    this.pendingSkillExpiresAt = 0;
+    this.pendingSkillOrigin = null;
+    this.skillButton.setVisible(false);
+    this.activateSkill(this.player, skill, this.time.now, origin);
+  }
+
+  activateSkill(snake, skill, time, skillOrigin = null) {
     if (snake.isPlayer) this.activeSkillLabel = skill.toUpperCase();
+
     if (skill === 'Slow') {
-      this.snakes.filter(s => s !== snake).forEach(s => s.slowedUntil = Math.max(s.slowedUntil, time + 8000));
+      const origin = skillOrigin || snake.positions[0];
+      this.snakes.filter(s => s !== snake).forEach(target => {
+        const h = target.positions[0];
+        const dx = Math.min(Math.abs(h.x - origin.x), COLS - Math.abs(h.x - origin.x));
+        const dy = Math.min(Math.abs(h.y - origin.y), ROWS - Math.abs(h.y - origin.y));
+        if (dx + dy <= 7) target.slowedUntil = Math.max(target.slowedUntil, time + 8000);
+      });
+      if (snake.isPlayer) this.flash('SLOW AREA · radius 7 tiles', 1200);
     } else if (skill === 'Fire') {
       this.castFire(snake, time);
     } else if (skill === 'Grapple Tongue') {
       this.castGrapple(snake, time);
     } else if (skill === 'Venom Trail') {
       snake.venomUntil = time + 10000;
+      if (snake.isPlayer) this.flash('VENOM TRAIL · 10s', 1100);
     } else if (skill === 'Spike Skin') {
       snake.spikeUntil = time + 8000;
+      if (snake.isPlayer) this.flash('SPIKE SKIN · 8s', 1100);
     }
-    this.time.delayedCall(8000, () => { if (snake.isPlayer && this.activeSkillLabel === skill.toUpperCase()) this.activeSkillLabel = ''; });
+
+    this.time.delayedCall(8000, () => {
+      if (snake.isPlayer && this.activeSkillLabel === skill.toUpperCase()) this.activeSkillLabel = '';
+    });
   }
 
   castFire(snake, time) {
     const h = snake.positions[0];
-    const end = { x: h.x + snake.dir.x * 6, y: h.y + snake.dir.y * 6 };
-    const a = centerOf(h), b = centerOf(end);
-    this.effectGfx.lineStyle(22, 0xff6b24, 0.88).lineBetween(a.x, a.y, b.x, b.y);
-    this.effectGfx.lineStyle(8, 0xffd166, 0.96).lineBetween(a.x, a.y, b.x, b.y);
-    this.time.delayedCall(550, () => this.effectGfx.clear());
-    this.snakes.filter(s => s !== snake).forEach(target => {
-      const p = target.positions[0];
-      const aligned = snake.dir.x !== 0 ? p.y === h.y && (p.x - h.x) * snake.dir.x > 0 && Math.abs(p.x - h.x) <= 6
-        : p.x === h.x && (p.y - h.y) * snake.dir.y > 0 && Math.abs(p.y - h.y) <= 6;
-      if (aligned) {
-        const before = target.positions.length;
-        this.damageSnake(target, 3, true);
-        snake.score += Math.max(0, before - target.positions.length) * 5;
-      }
+    const fireTiles = [];
+
+    // GDD v2 range = 6 tiles. Stop on an obstacle, and wrap at map edges.
+    for (let i = 1; i <= 6; i++) {
+      const tile = {
+        x: (h.x + snake.dir.x * i + COLS) % COLS,
+        y: (h.y + snake.dir.y * i + ROWS) % ROWS
+      };
+      if (this.walls.has(tileKey(tile.x, tile.y))) break;
+      fireTiles.push(tile);
+    }
+
+    // Draw discrete flame bursts per tile so this reads as FIRE, not a laser beam.
+    fireTiles.forEach((tile, i) => {
+      const c = centerOf(tile);
+      const r = Math.max(12, 24 - i * 1.7);
+      this.effectGfx.fillStyle(i % 2 ? 0xff7a18 : 0xffb11b, 0.88).fillCircle(c.x, c.y, r);
+      this.effectGfx.fillStyle(0xffe08a, 0.82).fillCircle(c.x - snake.dir.x * 5, c.y - snake.dir.y * 5, r * 0.45);
+      const sideX = snake.dir.y * r * 0.7, sideY = -snake.dir.x * r * 0.7;
+      this.effectGfx.fillStyle(0xf04420, 0.74).fillTriangle(
+        c.x + sideX, c.y + sideY,
+        c.x - sideX, c.y - sideY,
+        c.x + snake.dir.x * (r * 1.7), c.y + snake.dir.y * (r * 1.7)
+      );
     });
+    this.time.delayedCall(650, () => this.effectGfx.clear());
+
+    const fireKeys = new Set(fireTiles.map(t => tileKey(t.x, t.y)));
+    this.snakes.filter(s => s !== snake).forEach(target => {
+      const hit = target.positions.some(p => fireKeys.has(tileKey(p.x, p.y)));
+      if (!hit) return;
+      const before = target.positions.length;
+      this.damageSnake(target, 3, true);
+      snake.score += Math.max(0, before - target.positions.length) * 5;
+    });
+
+    if (snake.isPlayer) this.flash(`FIRE · range ${fireTiles.length}/6 tiles`, 900);
   }
 
   castGrapple(snake) {
@@ -762,8 +913,14 @@ class GameScene extends Phaser.Scene {
     const look = TILE * 1.55;
     const tx = sprite.x + this.player.dir.x * look;
     const ty = sprite.y + this.player.dir.y * look;
-    this.cameraFocus.x = Phaser.Math.Linear(this.cameraFocus.x, tx, 0.08);
-    this.cameraFocus.y = Phaser.Math.Linear(this.cameraFocus.y, ty, 0.08);
+
+    if (Phaser.Math.Distance.Between(this.cameraFocus.x, this.cameraFocus.y, tx, ty) > TILE * 8) {
+      this.cameraFocus.setPosition(tx, ty);
+    } else {
+      this.cameraFocus.x = Phaser.Math.Linear(this.cameraFocus.x, tx, 0.08);
+      this.cameraFocus.y = Phaser.Math.Linear(this.cameraFocus.y, ty, 0.08);
+    }
+
     let targetZoom = 1.05 - Math.max(0, this.player.positions.length - 2) * 0.018;
     if (this.starRushUntil > time) targetZoom -= 0.10;
     targetZoom = Phaser.Math.Clamp(targetZoom, 0.68, 1.05);
@@ -777,8 +934,16 @@ class GameScene extends Phaser.Scene {
     this.scoreText.setText(`🍎 ${this.player.score}`);
     const sorted = [...this.snakes].sort((a, b) => b.score - a.score);
     this.rankText.setText(`#${sorted.indexOf(this.player) + 1}`);
-    this.comboText.setText(this.starRushUntil > time ? `★ STAR RUSH ${Math.ceil((this.starRushUntil - time) / 1000)}s` : `COMBO ${this.comboCount}/5`);
-    this.skillText.setText(this.activeSkillLabel);
+    this.comboText.setText(this.starRushUntil > time
+      ? `★ STAR RUSH ${Math.ceil((this.starRushUntil - time) / 1000)}s`
+      : `COMBO ${this.comboCount}/5`);
+
+    if (this.pendingSkill) {
+      const left = Math.max(0, Math.ceil((this.pendingSkillExpiresAt - time) / 1000));
+      this.skillText.setText(`READY ${this.pendingSkill.toUpperCase()} ${left}s`);
+    } else {
+      this.skillText.setText(this.activeSkillLabel);
+    }
   }
 
   flash(text, duration = 1100) {
