@@ -1,0 +1,9 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 128">
+<defs>
+  <linearGradient id="r" x1="0" y1="0" x2="1" y2="1"><stop stop-color="#b6aa91"/><stop offset=".55" stop-color="#958973"/><stop offset="1" stop-color="#746957"/></linearGradient>
+  <filter id="s"><feDropShadow dx="0" dy="5" stdDeviation="4" flood-opacity=".18"/></filter>
+</defs>
+<path filter="url(#s)" fill="url(#r)" d="M20 102C12 86 19 52 39 30 63 4 126 8 165 12l282 1c26 1 42 14 47 34l-5 44c-4 17-20 24-45 25H67c-25 0-39-4-47-14Z"/>
+<path fill="#c7bba2" opacity=".42" d="m52 30 73-17 47 5-36 35-74 7Zm121-12 82-5 51 2-38 38-90 2Zm135-3 98-2 45 6-37 32-86 2Z"/>
+<path fill="#6f6656" opacity=".22" d="m40 91 95-34 102 2-55 48H67c-13 0-22-5-27-16Zm143 16 84-48 95-2-43 52Zm138 2 43-52 121-5 4 39c-3 12-13 18-32 19Z"/>
+</svg>
