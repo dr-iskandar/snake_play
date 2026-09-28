@@ -203,8 +203,8 @@ class GameScene extends Phaser.Scene {
       name, skin, positions: positions.map(p => ({ ...p })), prevPositions: positions.map(p => ({ ...p })),
       dir: { ...dir }, queuedDir: { ...dir }, isPlayer: player, score: 0, elapsed: 0,
       stepMs: player ? PLAYER_STEP_MS : BOT_STEP_MS, sprites: [], stunnedUntil: 0,
-      slowedUntil: 0, invisibleUntil: 0, spikeUntil: 0, venomUntil: 0,
-      collisionCooldownUntil: 0, ghostUntil: 0
+      slowedUntil: 0, invisibleUntil: 0, phaseUntil: 0, spikeUntil: 0, venomUntil: 0,
+      collisionCooldownUntil: 0, collisionStreak: 0
     };
     this.syncSnakeSprites(snake);
     return snake;
@@ -389,10 +389,23 @@ class GameScene extends Phaser.Scene {
     };
     const wrapped = rawNext.x !== next.x || rawNext.y !== next.y;
 
+    // Invisibility is true phasing: pass through own body and every other snake.
+    // Obstacles stay solid. If invisibility ends while embedded, keep a short collision
+    // phase until the head exits the overlap so the snake cannot get trapped instantly.
+    let phasing = this.isSnakePhasing(snake, time);
+    if (!phasing && snake.invisibleUntil > 0 && this.isSnakeEmbedded(snake, time)) {
+      snake.phaseUntil = Math.max(snake.phaseUntil, time + 450);
+      phasing = true;
+    }
+
     const hitObstacle = this.walls.has(tileKey(next.x, next.y));
-    const hitSelf = snake.positions.slice(1, -1).some(p => sameTile(p, next));
-    const hitOther = time >= snake.ghostUntil
-      ? this.snakes.find(s => s !== snake && s.positions.some(p => sameTile(p, next)))
+    const hitSelf = !phasing && snake.positions.slice(1, -1).some(p => sameTile(p, next));
+    const hitOther = !phasing
+      ? this.snakes.find(other =>
+          other !== snake &&
+          !this.isSnakePhasing(other, time) &&
+          other.positions.some(p => sameTile(p, next))
+        )
       : null;
 
     if (hitObstacle || hitSelf || hitOther) {
@@ -405,6 +418,7 @@ class GameScene extends Phaser.Scene {
       return;
     }
 
+    snake.collisionStreak = 0;
     const old = snake.positions.map(p => ({ ...p }));
     snake.prevPositions = old;
     snake.positions.unshift(next);
@@ -423,27 +437,79 @@ class GameScene extends Phaser.Scene {
     this.syncSnakeSprites(snake);
   }
 
+  isSnakePhasing(snake, time = this.time.now) {
+    return time < snake.invisibleUntil || time < snake.phaseUntil;
+  }
+
+  isSnakeEmbedded(snake, time = this.time.now) {
+    const head = snake.positions[0];
+    const inSelf = snake.positions.slice(1, -1).some(p => sameTile(p, head));
+    const inOther = this.snakes.some(other =>
+      other !== snake &&
+      !this.isSnakePhasing(other, time) &&
+      other.positions.some(p => sameTile(p, head))
+    );
+    return inSelf || inOther;
+  }
+
+  tryBounceBack(snake, time) {
+    const dx = -snake.dir.x;
+    const dy = -snake.dir.y;
+    const shifted = snake.positions.map(p => ({
+      x: (p.x + dx + COLS) % COLS,
+      y: (p.y + dy + ROWS) % ROWS
+    }));
+
+    if (shifted.some(p => this.walls.has(tileKey(p.x, p.y)))) return false;
+    const occupied = this.snakes.some(other =>
+      other !== snake &&
+      !this.isSnakePhasing(other, time) &&
+      shifted.some(p => other.positions.some(op => sameTile(op, p)))
+    );
+    if (occupied) return false;
+
+    const old = snake.positions.map(p => ({ ...p }));
+    snake.prevPositions = old;
+    snake.positions = shifted;
+    this.syncSnakeSprites(snake);
+    return true;
+  }
+
   handleCollision(snake, time, hitOther = null, hitSolid = false, alreadyDamaged = false) {
-    // One collision = at most one tail loss. A short ghost/grace window lets a trapped snake escape,
-    // instead of both snakes repeatedly shrinking while heads are boxed in.
+    snake.collisionStreak += 1;
+
+    // One contact does not repeatedly eat the tail every simulation tick.
     if (!alreadyDamaged && time >= snake.collisionCooldownUntil) {
       this.damageSnake(snake, 1, false);
-      snake.collisionCooldownUntil = time + 850;
+      snake.collisionCooldownUntil = time + 900;
     }
 
-    const options = DIRS.filter(d => !opposite(d, snake.dir) && this.isSafeNext(snake, d, true));
+    // Head-to-snake collision gets an actual one-tile-ish bounce when space allows.
+    // This separates two snakes instead of leaving two 2-part "balls" touching forever.
+    if (hitOther) this.tryBounceBack(snake, time);
+
+    // First prefer normal Snake turns. If boxed in, allow an emergency reversal only
+    // when that destination is genuinely empty. This is recovery logic, not normal input.
+    let options = DIRS.filter(d => !opposite(d, snake.dir) && this.isSafeNext(snake, d, true, time));
+    if (!options.length) options = DIRS.filter(d => this.isSafeNext(snake, d, true, time));
+
     if (options.length) {
       const chosen = Phaser.Utils.Array.GetRandom(options);
       snake.queuedDir = { ...chosen };
       snake.dir = { ...chosen };
+      snake.collisionStreak = 0;
+    } else if (snake.collisionStreak >= 3 && !hitSolid) {
+      // Last-resort anti-deadlock only for snake-vs-snake traps.
+      // Briefly phase through snakes (never obstacles) so a fully enclosed snake can escape.
+      snake.phaseUntil = Math.max(snake.phaseUntil, time + snake.stepMs * 2.2);
+      snake.collisionStreak = 0;
     }
 
-    if (hitOther || !options.length) snake.ghostUntil = Math.max(snake.ghostUntil, time + 750);
-    snake.stunnedUntil = Math.max(snake.stunnedUntil, time + (hitSolid ? 120 : 80));
+    snake.stunnedUntil = Math.max(snake.stunnedUntil, time + (hitSolid ? 100 : 55));
 
     if (snake.isPlayer) {
-      this.cameras.main.shake(90, 0.006);
-      this.flash(hitOther ? 'BUMP! -1 tail · escape grace' : 'Obstacle! -1 tail');
+      this.cameras.main.shake(75, 0.005);
+      this.flash(hitOther ? 'BUMP! -1 tail' : 'Obstacle! -1 tail');
     }
   }
 
@@ -459,29 +525,52 @@ class GameScene extends Phaser.Scene {
     if (bounce) snake.stunnedUntil = this.time.now + 700;
   }
 
-  isSafeNext(snake, dir, avoidOtherSnakes = false) {
+  isSafeNext(snake, dir, avoidOtherSnakes = false, time = this.time.now) {
     const h = snake.positions[0];
     const raw = { x: h.x + dir.x, y: h.y + dir.y };
     const n = { x: (raw.x + COLS) % COLS, y: (raw.y + ROWS) % ROWS };
+    const phasing = this.isSnakePhasing(snake, time);
 
     if (this.walls.has(tileKey(n.x, n.y))) return false;
-    if (snake.positions.slice(1, -1).some(p => sameTile(p, n))) return false;
-    if (avoidOtherSnakes && this.snakes.some(s => s !== snake && s.positions.some(p => sameTile(p, n)))) return false;
+    if (!phasing && snake.positions.slice(1, -1).some(p => sameTile(p, n))) return false;
+
+    if (avoidOtherSnakes && !phasing) {
+      const blocked = this.snakes.some(other =>
+        other !== snake &&
+        !this.isSnakePhasing(other, time) &&
+        other.positions.some(p => sameTile(p, n))
+      );
+      if (blocked) return false;
+    }
     return true;
   }
 
   chooseBotDirection(snake) {
     const targetItem = this.closestCollectible(snake.positions[0]);
-    const candidates = DIRS.filter(d => !opposite(d, snake.dir) && this.isSafeNext(snake, d));
-    if (!candidates.length) return;
+
+    // NPC pathing must respect player/NPC bodies. Previously this call ignored other snakes,
+    // which made bots occasionally choose a tile already occupied by the player.
+    const candidates = DIRS.filter(d =>
+      !opposite(d, snake.dir) && this.isSafeNext(snake, d, true, this.time.now)
+    );
+
+    if (!candidates.length) {
+      const emergency = DIRS.filter(d => this.isSafeNext(snake, d, true, this.time.now));
+      if (emergency.length) snake.queuedDir = { ...Phaser.Utils.Array.GetRandom(emergency) };
+      return;
+    }
+
     if (!targetItem || Math.random() < 0.16) {
       snake.queuedDir = { ...Phaser.Utils.Array.GetRandom(candidates) };
       return;
     }
+
     candidates.sort((a, b) => {
       const h = snake.positions[0];
-      const da = Math.abs(h.x + a.x - targetItem.tile.x) + Math.abs(h.y + a.y - targetItem.tile.y);
-      const db = Math.abs(h.x + b.x - targetItem.tile.x) + Math.abs(h.y + b.y - targetItem.tile.y);
+      const ax = (h.x + a.x + COLS) % COLS, ay = (h.y + a.y + ROWS) % ROWS;
+      const bx = (h.x + b.x + COLS) % COLS, by = (h.y + b.y + ROWS) % ROWS;
+      const da = Math.abs(ax - targetItem.tile.x) + Math.abs(ay - targetItem.tile.y);
+      const db = Math.abs(bx - targetItem.tile.x) + Math.abs(by - targetItem.tile.y);
       return da - db;
     });
     snake.queuedDir = { ...candidates[0] };
@@ -758,6 +847,7 @@ class GameScene extends Phaser.Scene {
     this.quizUI.forEach(x => x.setVisible(false));
     this.quizOrb.setVisible(false);
     this.player.invisibleUntil = time + 8000;
+    this.player.phaseUntil = Math.max(this.player.phaseUntil, time + 8000);
 
     if (correct) {
       const skill = Phaser.Utils.Array.GetRandom(SKILLS);
@@ -945,7 +1035,8 @@ class GameScene extends Phaser.Scene {
       const left = Math.max(0, Math.ceil((this.pendingSkillExpiresAt - time) / 1000));
       this.skillText.setText(`READY ${this.pendingSkill.toUpperCase()} ${left}s`);
     } else {
-      this.skillText.setText(this.activeSkillLabel);
+      const phase = this.isSnakePhasing(this.player, time) ? ' · PHASE' : '';
+      this.skillText.setText(`${this.activeSkillLabel}${phase}`.trim());
     }
   }
 
