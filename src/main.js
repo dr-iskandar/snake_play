@@ -396,9 +396,12 @@ class GameScene extends Phaser.Scene {
       : null;
 
     if (hitObstacle || hitSelf || hitOther) {
-      if (hitOther && time < snake.spikeUntil) this.damageSnake(hitOther, 1, true);
-      if (hitOther && time < hitOther.spikeUntil) this.damageSnake(snake, 1, true);
-      this.handleCollision(snake, time, hitOther, hitObstacle || hitSelf);
+      const hitSpike = !!(hitOther && time < hitOther.spikeUntil);
+      if (hitSpike) {
+        this.damageSnake(snake, 1, true);
+        snake.stunnedUntil = Math.max(snake.stunnedUntil, time + 3000);
+      }
+      this.handleCollision(snake, time, hitOther, hitObstacle || hitSelf, hitSpike);
       return;
     }
 
@@ -420,10 +423,10 @@ class GameScene extends Phaser.Scene {
     this.syncSnakeSprites(snake);
   }
 
-  handleCollision(snake, time, hitOther = null, hitSolid = false) {
+  handleCollision(snake, time, hitOther = null, hitSolid = false, alreadyDamaged = false) {
     // One collision = at most one tail loss. A short ghost/grace window lets a trapped snake escape,
     // instead of both snakes repeatedly shrinking while heads are boxed in.
-    if (time >= snake.collisionCooldownUntil) {
+    if (!alreadyDamaged && time >= snake.collisionCooldownUntil) {
       this.damageSnake(snake, 1, false);
       snake.collisionCooldownUntil = time + 850;
     }
