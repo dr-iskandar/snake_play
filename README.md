@@ -1,49 +1,37 @@
-# Chain Play
+# Hoople Play — Snakes
 
-Portrait-first, brandable chain-follow game prototype inspired by Snake.io-style movement.
+A portrait-first web prototype based on the Hoople Play Snakes GDD.
 
-## Features
+## Current prototype
 
-- Smooth free-direction movement
-- Portrait responsive layout
-- Drag joystick plus WASD / arrow controls
-- Dynamic camera look-ahead
-- Automatic zoom in/out based on chain length and boost state
-- Collectibles, speed boost, mystery rewards and obstacles
-- Modular leader/head plus follower segment architecture
-- Live theme switch between Snake Garden and Shopping Rush
-- Shopping Rush demonstrates the brand-reskin concept: character leader plus product-like follower chain
-- Theme definitions are separated in src/themes.js
-- Prototype art is generated directly in Phaser, so it runs without external image assets
+- 60 × 50 tile world with a portrait zoomed-in camera
+- Swipe / slide directional control, plus keyboard controls for desktop testing
+- Retro grid movement with smooth visual interpolation
+- Uses the supplied stylized snake Head / Body / Tail assets
+- Player starts with Head + Tail; Apple adds one Body segment
+- Beige, White, Green, and Red player skins
+- Apple: +10 score, +1 length
+- 5-Apple combo triggers a 25-Star global Star Rush for 30 seconds
+- Star: +20 score, +2 length
+- Black Box opens a 15-second quiz
+- Correct Black Box quiz grants one of: Slow, Fire, Grapple Tongue, Venom Trail, Spike Skin
+- 8-second post-quiz invisibility effect
+- 2-minute match timer
+- Two local AI snakes to make the competitive mechanics testable before networking
+- Collision mode currently follows the GDD's second option: bump + tail loss
+- Dynamic camera look-ahead and zoom based on snake length / Star Rush state
+- End panel shows Score and Highest Combo
 
-## Run locally
+## Important
 
-Serve the folder over HTTP:
+The AI opponents are local simulation only. Real multiplayer networking, lobby/session sync, host parameters, CMS quiz content, analytics, audio, and production persistence are not implemented yet.
 
-    python3 -m http.server 8080
+`COMBO_WINDOW_MS` is currently a prototype tuning value because the GDD defines the 5-Apple combo condition but does not specify the exact combo-window duration.
 
-Then open:
+## Run
 
-    http://localhost:8080
+```bash
+python3 -m http.server 8080
+```
 
-## Main files
-
-- index.html - page shell and Phaser loader
-- style.css - portrait responsive container
-- src/main.js - gameplay, movement, camera, collision and UI
-- src/themes.js - modular brand/theme configuration
-
-## Brand personalization
-
-Add a new object in src/themes.js, then map its head, segment palette, collectibles and obstacle palette. The gameplay code stays the same.
-
-For production, generated prototype textures can be replaced by PNG, WebP, SVG or sprite atlases without changing the gameplay architecture.
-
-## Next recommended production steps
-
-- Move map definitions into JSON
-- Add real animated sprite atlases
-- Add missions and levels
-- Add sound and haptics
-- Add analytics hooks
-- Add leaderboard/backend only when needed
+Open `http://localhost:8080`.

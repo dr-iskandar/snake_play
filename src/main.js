@@ -1,618 +1,697 @@
-import { THEME_PACKS } from './themes.js';
-
 const GAME_W = 450;
 const GAME_H = 800;
-const WORLD_W = 1400;
-const WORLD_H = 2400;
-const GRID = 80;
+const TILE = 64;
+const COLS = 60;
+const ROWS = 50;
+const WORLD_W = COLS * TILE;
+const WORLD_H = ROWS * TILE;
+const SESSION_MS = 120000;
+const PLAYER_STEP_MS = 185;
+const BOT_STEP_MS = 215;
+const COMBO_WINDOW_MS = 10000; // prototype tuning; GDD only states "nearby time"
+
+const FRAME = {
+  beige: { body: 0, head: 1, tail: 2 },
+  green: { body: 3, head: 4, tail: 5 },
+  red: { body: 6, head: 7, tail: 8 },
+  tongue: 9,
+  white: { body: 10, head: 11, tail: 12 }
+};
+const SKINS = ['beige', 'white', 'green', 'red'];
+const DIRS = [
+  { x: 0, y: -1, name: 'up' },
+  { x: 1, y: 0, name: 'right' },
+  { x: 0, y: 1, name: 'down' },
+  { x: -1, y: 0, name: 'left' }
+];
+const QUIZ_BANK = [
+  { q: 'What is the snake’s main food?', options: ['Apple', 'Clock', 'Diamond'], answer: 0 },
+  { q: 'How many apples trigger a combo?', options: ['3', '5', '10'], answer: 1 },
+  { q: 'Which combo item adds +2 length?', options: ['Star', 'Apple', 'Wall'], answer: 0 }
+];
+const SKILLS = ['Slow', 'Fire', 'Grapple Tongue', 'Venom Trail', 'Spike Skin'];
+
+const tileKey = (x, y) => `${x},${y}`;
+const sameTile = (a, b) => a.x === b.x && a.y === b.y;
+const centerOf = (p) => ({ x: p.x * TILE + TILE / 2, y: p.y * TILE + TILE / 2 });
+const opposite = (a, b) => a.x === -b.x && a.y === -b.y;
+const headRotation = (d) => Math.atan2(d.y, d.x) + Math.PI / 2;
+const tailRotation = (d) => Math.atan2(d.y, d.x) - Math.PI / 2;
 
 class GameScene extends Phaser.Scene {
-  constructor() {
-    super('game');
+  constructor() { super('game'); }
+
+  preload() {
+    this.load.spritesheet('snakeParts', './assets/snake-sprites.webp', {
+      frameWidth: 96,
+      frameHeight: 96,
+      endFrame: 15
+    });
   }
 
   create() {
-    this.themeId = 'snake';
-    this.theme = THEME_PACKS[this.themeId];
-    this.score = 0;
-    this.baseSpeed = 225;
-    this.boostUntil = 0;
-    this.shield = 0;
-    this.invulnerableUntil = 0;
-    this.isGameOver = false;
+    this.gameStartedAt = this.time.now;
+    this.gameEndsAt = this.gameStartedAt + SESSION_MS;
+    this.gameOver = false;
+    this.comboCount = 0;
+    this.highestCombo = 0;
+    this.comboDeadline = 0;
+    this.starRushUntil = 0;
+    this.quiz = null;
+    this.activeSkillLabel = '';
+    this.lastBlackBoxSpawn = this.time.now;
+    this.blackBox = null;
+    this.apple = null;
+    this.stars = [];
+    this.poisonTiles = [];
+    this.swipeStart = null;
 
-    this.direction = new Phaser.Math.Vector2(0, -1);
-    this.targetDirection = this.direction.clone();
-    this.pointerDirection = new Phaser.Math.Vector2();
-    this.joystickActive = false;
-    this.joystickPointerId = null;
-    this.joystickOrigin = new Phaser.Math.Vector2();
-
-    this.makeTextures();
+    this.makeItemTextures();
     this.buildWorld();
-    this.buildPlayer();
-    this.buildCollectibles();
+    this.buildSnakes();
+    this.buildEffects();
     this.buildUI();
     this.bindInput();
     this.configureCamera();
+
+    this.spawnApple();
+    this.time.delayedCall(4500, () => this.spawnBlackBox());
   }
 
-  update(time, delta) {
-    if (this.isGameOver) return;
-
-    const dt = Math.min(delta / 1000, 0.04);
-    this.readDirectionInput();
-    this.movePlayer(time, dt);
-    this.updateChain();
-    this.handleCollectibles(time);
-    this.handleObstacleCollision(time);
-    this.updateCamera(time);
-    this.updateUI(time);
-  }
-
-  makeTextures() {
-    const circle = (key, radius, fill, stroke, strokeWidth) => {
+  makeItemTextures() {
+    const make = (key, draw, w = 64, h = 64) => {
       if (this.textures.exists(key)) return;
       const g = this.make.graphics({ add: false });
-      g.fillStyle(fill, 1);
-      g.lineStyle(strokeWidth, stroke, 1);
-      g.fillCircle(radius, radius, radius - strokeWidth / 2);
-      g.strokeCircle(radius, radius, radius - strokeWidth / 2);
-      g.generateTexture(key, radius * 2, radius * 2);
+      draw(g, w, h);
+      g.generateTexture(key, w, h);
       g.destroy();
     };
 
-    Object.values(THEME_PACKS).forEach((theme) => {
-      circle(theme.id + '-head', 24, theme.head.fill, theme.head.stroke, 4);
-      theme.bodyPalette.forEach((color, i) => {
-        circle(theme.id + '-body-' + i, 18, color, theme.head.stroke, 2);
-      });
+    make('apple', (g) => {
+      g.fillStyle(0x000000, 0.13).fillCircle(34, 38, 18);
+      g.fillStyle(0xe53935, 1).fillCircle(30, 32, 17);
+      g.fillStyle(0xbe2727, 1).fillCircle(38, 34, 13);
+      g.fillStyle(0x6d4024, 1).fillRect(30, 8, 4, 11);
+      g.fillStyle(0x53a653, 1).fillEllipse(40, 14, 15, 7);
+      g.fillStyle(0xffffff, 0.55).fillCircle(25, 26, 4);
     });
 
-    if (!this.textures.exists('item-apple')) {
-      const g = this.make.graphics({ add: false });
-      g.fillStyle(0xd92f2f, 1).fillCircle(18, 19, 14);
-      g.fillStyle(0x6b3e26, 1).fillRect(17, 1, 4, 9);
-      g.fillStyle(0x4d9b51, 1).fillEllipse(24, 6, 11, 6);
-      g.generateTexture('item-apple', 36, 38);
-      g.destroy();
-    }
-
-    if (!this.textures.exists('item-star')) {
-      const g = this.make.graphics({ add: false });
+    make('star', (g) => {
       const pts = [];
       for (let i = 0; i < 10; i++) {
         const a = -Math.PI / 2 + i * Math.PI / 5;
-        const r = i % 2 === 0 ? 17 : 8;
-        pts.push(new Phaser.Math.Vector2(20 + Math.cos(a) * r, 20 + Math.sin(a) * r));
+        const r = i % 2 === 0 ? 25 : 11;
+        pts.push(new Phaser.Math.Vector2(32 + Math.cos(a) * r, 32 + Math.sin(a) * r));
       }
-      g.fillStyle(0xffd54a, 1);
-      g.lineStyle(3, 0xb48417, 1);
-      g.fillPoints(pts, true);
-      g.strokePoints(pts, true);
-      g.generateTexture('item-star', 40, 40);
-      g.destroy();
-    }
+      g.fillStyle(0xffd84d, 1).fillPoints(pts, true);
+      g.lineStyle(4, 0xe49d17, 1).strokePoints(pts, true);
+      g.fillStyle(0xffffff, 0.5).fillCircle(26, 23, 4);
+    });
 
-    if (!this.textures.exists('item-coin')) {
-      const g = this.make.graphics({ add: false });
-      g.fillStyle(0xffd166, 1).fillCircle(18, 18, 16);
-      g.lineStyle(3, 0xb98211, 1).strokeCircle(18, 18, 15);
-      g.generateTexture('item-coin', 36, 36);
-      g.destroy();
-    }
+    make('blackbox', (g) => {
+      g.fillStyle(0x000000, 0.18).fillRoundedRect(8, 10, 50, 50, 10);
+      g.fillStyle(0x151823, 1).fillRoundedRect(5, 5, 50, 50, 10);
+      g.lineStyle(4, 0x6f5be8, 1).strokeRoundedRect(5, 5, 50, 50, 10);
+    });
 
-    if (!this.textures.exists('item-coupon')) {
-      const g = this.make.graphics({ add: false });
-      g.fillStyle(0xff7a8a, 1).fillRoundedRect(2, 5, 40, 30, 7);
-      g.lineStyle(3, 0x8f3948, 1).strokeRoundedRect(2, 5, 40, 30, 7);
-      g.generateTexture('item-coupon', 44, 40);
-      g.destroy();
-    }
-
-    if (!this.textures.exists('item-mystery')) {
-      const g = this.make.graphics({ add: false });
-      g.fillStyle(0x1f2937, 1).fillRoundedRect(2, 2, 38, 38, 8);
-      g.lineStyle(3, 0x94a3b8, 1).strokeRoundedRect(2, 2, 38, 38, 8);
-      g.generateTexture('item-mystery', 42, 42);
-      g.destroy();
-    }
+    make('poison', (g) => {
+      g.fillStyle(0x7346a8, 0.34).fillCircle(32, 32, 24);
+      g.lineStyle(3, 0x9d6ed2, 0.72).strokeCircle(32, 32, 21);
+    });
   }
 
   buildWorld() {
-    this.backgroundGraphics = this.add.graphics().setDepth(-20);
-    this.obstacleGraphics = this.add.graphics().setDepth(-5);
-    this.obstacles = [
-      new Phaser.Geom.Rectangle(140, 220, 300, 60),
-      new Phaser.Geom.Rectangle(760, 180, 290, 66),
-      new Phaser.Geom.Rectangle(1100, 410, 80, 260),
-      new Phaser.Geom.Rectangle(360, 620, 280, 72),
-      new Phaser.Geom.Rectangle(860, 760, 320, 68),
-      new Phaser.Geom.Rectangle(150, 920, 92, 300),
-      new Phaser.Geom.Rectangle(520, 1080, 330, 76),
-      new Phaser.Geom.Rectangle(1020, 1190, 92, 340),
-      new Phaser.Geom.Rectangle(230, 1460, 340, 74),
-      new Phaser.Geom.Rectangle(720, 1580, 290, 72),
-      new Phaser.Geom.Rectangle(1160, 1700, 82, 280),
-      new Phaser.Geom.Rectangle(370, 1970, 300, 72),
-      new Phaser.Geom.Rectangle(870, 2140, 350, 70)
-    ];
-    this.redrawWorld();
-  }
+    this.walls = new Set();
+    const addWallH = (x, y, length) => { for (let i = 0; i < length; i++) this.walls.add(tileKey(x + i, y)); };
+    const addWallV = (x, y, length) => { for (let i = 0; i < length; i++) this.walls.add(tileKey(x, y + i)); };
 
-  redrawWorld() {
-    const g = this.backgroundGraphics;
-    g.clear();
+    // Map variant: large 60x50 world with internal walls. Edge is also a collision boundary.
+    addWallH(6, 7, 10); addWallV(16, 7, 8);
+    addWallV(33, 5, 12); addWallH(34, 17, 11);
+    addWallH(8, 24, 13); addWallV(21, 20, 9);
+    addWallV(43, 23, 12); addWallH(35, 35, 9);
+    addWallH(11, 40, 14); addWallV(27, 34, 9);
+    addWallV(52, 8, 10); addWallH(47, 18, 6);
 
-    for (let y = 0; y < WORLD_H; y += GRID) {
-      for (let x = 0; x < WORLD_W; x += GRID) {
-        const alt = ((x / GRID) + (y / GRID)) % 2 === 0;
-        g.fillStyle(alt ? this.theme.backgroundA : this.theme.backgroundB, 1);
-        g.fillRect(x, y, GRID, GRID);
+    this.bg = this.add.graphics().setDepth(-30);
+    for (let y = 0; y < ROWS; y++) {
+      for (let x = 0; x < COLS; x++) {
+        this.bg.fillStyle((x + y) % 2 ? 0xdbe9c5 : 0xe9f0d2, 1);
+        this.bg.fillRect(x * TILE, y * TILE, TILE, TILE);
       }
     }
+    this.bg.lineStyle(1.5, 0xb9ce96, 0.55);
+    for (let x = 0; x <= COLS; x++) this.bg.lineBetween(x * TILE, 0, x * TILE, WORLD_H);
+    for (let y = 0; y <= ROWS; y++) this.bg.lineBetween(0, y * TILE, WORLD_W, y * TILE);
 
-    g.lineStyle(2, this.theme.gridLine, 0.48);
-    for (let x = 0; x <= WORLD_W; x += GRID) g.lineBetween(x, 0, x, WORLD_H);
-    for (let y = 0; y <= WORLD_H; y += GRID) g.lineBetween(0, y, WORLD_W, y);
-
-    this.obstacleGraphics.clear();
-    this.obstacles.forEach((rect, i) => this.drawObstacle(rect, i));
+    this.wallGfx = this.add.graphics().setDepth(-8);
+    this.walls.forEach((k) => {
+      const [x, y] = k.split(',').map(Number);
+      const px = x * TILE + 6, py = y * TILE + 9;
+      this.wallGfx.fillStyle(0x000000, 0.11).fillRoundedRect(px + 5, py + 6, TILE - 12, TILE - 18, 14);
+      this.wallGfx.fillStyle(0x8c806c, 1).fillRoundedRect(px, py, TILE - 12, TILE - 18, 14);
+      this.wallGfx.lineStyle(3, 0x665d4f, 0.78).strokeRoundedRect(px, py, TILE - 12, TILE - 18, 14);
+    });
   }
 
-  drawObstacle(rect, index) {
-    const g = this.obstacleGraphics;
-    const radius = Math.min(22, rect.height / 3);
-    g.fillStyle(0x000000, 0.10).fillRoundedRect(rect.x + 8, rect.y + 10, rect.width, rect.height, radius);
-    g.fillStyle(this.theme.obstacle.fill, 1).fillRoundedRect(rect.x, rect.y, rect.width, rect.height, radius);
-    g.lineStyle(4, this.theme.obstacle.stroke, 0.85).strokeRoundedRect(rect.x, rect.y, rect.width, rect.height, radius);
-    g.lineStyle(2, 0xffffff, 0.08);
+  buildSnakes() {
+    this.snakes = [];
+    this.player = this.createSnake('You', 'beige', [{ x: 29, y: 39 }, { x: 29, y: 40 }], { x: 0, y: -1 }, true);
+    this.snakes.push(this.player);
+    this.snakes.push(this.createSnake('Bot Red', 'red', [{ x: 10, y: 11 }, { x: 9, y: 11 }], { x: 1, y: 0 }, false));
+    this.snakes.push(this.createSnake('Bot Green', 'green', [{ x: 48, y: 30 }, { x: 48, y: 31 }], { x: 0, y: -1 }, false));
+  }
 
-    const lines = Math.max(2, Math.floor(rect.width / 90));
-    for (let i = 1; i < lines; i++) {
-      const lx = rect.x + rect.width / lines * i;
-      g.lineBetween(lx, rect.y + 8, lx - 10, rect.y + rect.height - 8);
+  createSnake(name, skin, positions, dir, player) {
+    const snake = {
+      name, skin, positions: positions.map(p => ({ ...p })), prevPositions: positions.map(p => ({ ...p })),
+      dir: { ...dir }, queuedDir: { ...dir }, isPlayer: player, score: 0, elapsed: 0,
+      stepMs: player ? PLAYER_STEP_MS : BOT_STEP_MS, sprites: [], stunnedUntil: 0,
+      slowedUntil: 0, invisibleUntil: 0, spikeUntil: 0, venomUntil: 0
+    };
+    this.syncSnakeSprites(snake);
+    return snake;
+  }
+
+  syncSnakeSprites(snake) {
+    while (snake.sprites.length < snake.positions.length) {
+      const sprite = this.add.sprite(0, 0, 'snakeParts', FRAME[snake.skin].body).setDepth(snake.isPlayer ? 25 : 18);
+      sprite.setDisplaySize(84, 84);
+      snake.sprites.push(sprite);
     }
+    while (snake.sprites.length > snake.positions.length) snake.sprites.pop().destroy();
 
-    if (index % 3 === 0) {
-      g.fillStyle(this.theme.obstacle.stroke, 0.55);
-      g.fillCircle(rect.x + rect.width * 0.22, rect.y + rect.height * 0.48, 7);
-    }
+    snake.sprites.forEach((s, i) => {
+      if (i === 0) s.setFrame(FRAME[snake.skin].head);
+      else if (i === snake.sprites.length - 1) s.setFrame(FRAME[snake.skin].tail);
+      else s.setFrame(FRAME[snake.skin].body);
+    });
+    this.renderSnake(snake, 1);
   }
 
-  buildPlayer() {
-    const startX = WORLD_W / 2;
-    const startY = WORLD_H * 0.78;
-
-    this.head = this.add.sprite(startX, startY, this.theme.id + '-head').setDepth(20);
-    this.headDecoration = this.add.text(startX, startY, '••', {
-      fontFamily: 'system-ui, sans-serif',
-      fontSize: '15px',
-      color: '#ffffff',
-      fontStyle: '700'
-    }).setOrigin(0.5).setDepth(21);
-
-    this.trail = [];
-    for (let i = 0; i < 700; i++) this.trail.push({ x: startX, y: startY + i * 1.8 });
-
-    this.segments = [];
-    for (let i = 0; i < 5; i++) this.addSegment();
-  }
-
-  addSegment() {
-    const i = this.segments.length;
-    const texture = this.theme.id + '-body-' + (i % this.theme.bodyPalette.length);
-    const sprite = this.add.sprite(this.head.x, this.head.y + 50 + i * 26, texture).setDepth(10 - i * 0.01);
-    let label = null;
-
-    if (this.theme.id === 'shopping') {
-      label = this.makeSegmentLabel(sprite, i);
-    }
-
-    this.segments.push({ sprite, label });
-  }
-
-  makeSegmentLabel(sprite, i) {
-    return this.add.text(sprite.x, sprite.y, this.theme.segmentLabels[i % this.theme.segmentLabels.length], {
-      fontFamily: 'system-ui, sans-serif',
-      fontSize: '8px',
-      color: '#2d2130',
-      fontStyle: '800'
-    }).setOrigin(0.5).setDepth(11);
-  }
-
-  removeSegments(count) {
-    for (let i = 0; i < count && this.segments.length > 2; i++) {
-      const seg = this.segments.pop();
-      seg.sprite.destroy();
-      if (seg.label) seg.label.destroy();
-    }
-  }
-
-  buildCollectibles() {
-    this.collectibles = [];
-    for (let i = 0; i < 12; i++) this.spawnCollectible('common');
-    for (let i = 0; i < 4; i++) this.spawnCollectible('power');
-    this.spawnCollectible('mystery');
-  }
-
-  safePoint() {
-    for (let attempt = 0; attempt < 80; attempt++) {
-      const x = Phaser.Math.Between(80, WORLD_W - 80);
-      const y = Phaser.Math.Between(100, WORLD_H - 100);
-      const nearPlayer = Phaser.Math.Distance.Between(x, y, this.head.x, this.head.y) < 180;
-      const blocked = this.obstacles.some((r) => {
-        const padded = new Phaser.Geom.Rectangle(r.x - 50, r.y - 50, r.width + 100, r.height + 100);
-        return Phaser.Geom.Rectangle.Contains(padded, x, y);
-      });
-      if (!nearPlayer && !blocked) return { x, y };
-    }
-    return { x: WORLD_W / 2, y: 220 };
-  }
-
-  spawnCollectible(kind, existing) {
-    const p = this.safePoint();
-    const type = this.theme.collectible[kind];
-    const texture = 'item-' + type;
-
-    if (existing) {
-      existing.kind = kind;
-      existing.type = type;
-      existing.sprite.setTexture(texture).setPosition(p.x, p.y).setVisible(true);
-      if (existing.label) existing.label.setPosition(p.x, p.y);
-      return;
-    }
-
-    const sprite = this.add.sprite(p.x, p.y, texture).setDepth(2);
-    let label = null;
-
-    if (kind === 'mystery') {
-      label = this.add.text(p.x, p.y, '?', { fontSize: '22px', color: '#ffffff', fontStyle: '900' }).setOrigin(0.5).setDepth(3);
-    }
-
-    this.collectibles.push({ kind, type, sprite, label });
+  buildEffects() {
+    this.effectGfx = this.add.graphics().setDepth(40);
+    this.quizOrb = this.add.circle(0, 0, 48, 0x17151f, 0.96).setStrokeStyle(5, 0x7864ff, 0.9).setDepth(45).setVisible(false);
+    this.poisonSprites = [];
   }
 
   buildUI() {
-    const panel = this.add.graphics().setScrollFactor(0).setDepth(100);
-    panel.fillStyle(0x111827, 0.82).fillRoundedRect(18, 18, 178, 66, 18);
-    panel.lineStyle(1, 0xffffff, 0.10).strokeRoundedRect(18, 18, 178, 66, 18);
+    const hud = this.add.rectangle(GAME_W / 2, 48, GAME_W - 24, 72, 0x16341e, 0.88)
+      .setStrokeStyle(2, 0xffffff, 0.12).setScrollFactor(0).setDepth(200);
+    this.scoreText = this.add.text(26, 26, '🍎 0', { fontFamily: 'system-ui', fontSize: '22px', fontStyle: '800', color: '#fff' })
+      .setScrollFactor(0).setDepth(201);
+    this.timerText = this.add.text(GAME_W / 2, 26, '2:00', { fontFamily: 'system-ui', fontSize: '22px', fontStyle: '900', color: '#fff' })
+      .setOrigin(0.5, 0).setScrollFactor(0).setDepth(201);
+    this.rankText = this.add.text(GAME_W - 26, 28, '#1', { fontFamily: 'system-ui', fontSize: '18px', fontStyle: '900', color: '#fff' })
+      .setOrigin(1, 0).setScrollFactor(0).setDepth(201);
 
-    this.scoreText = this.add.text(34, 30, 'Score 0', {
-      fontFamily: 'system-ui, sans-serif',
-      fontSize: '20px',
-      color: '#ffffff',
-      fontStyle: '800'
-    }).setScrollFactor(0).setDepth(101);
+    this.comboText = this.add.text(26, 58, 'COMBO 0/5', { fontFamily: 'system-ui', fontSize: '11px', fontStyle: '800', color: '#d9f99d' })
+      .setScrollFactor(0).setDepth(201);
+    this.skillText = this.add.text(GAME_W - 26, 58, '', { fontFamily: 'system-ui', fontSize: '11px', fontStyle: '800', color: '#ffd166' })
+      .setOrigin(1, 0).setScrollFactor(0).setDepth(201);
 
-    this.statusText = this.add.text(34, 57, 'Length 5', {
-      fontFamily: 'system-ui, sans-serif',
-      fontSize: '12px',
-      color: '#cbd5e1'
-    }).setScrollFactor(0).setDepth(101);
+    this.skinButton = this.add.text(GAME_W - 18, 102, 'BEIGE', {
+      fontFamily: 'system-ui', fontSize: '11px', fontStyle: '900', color: '#1b2430',
+      backgroundColor: '#f2eadc', padding: { x: 12, y: 8 }
+    }).setOrigin(1, 0).setScrollFactor(0).setDepth(202).setInteractive({ useHandCursor: true });
+    this.skinButton.on('pointerdown', () => this.cycleSkin());
 
-    this.themeButton = this.add.text(GAME_W - 18, 24, 'SHOPPING', {
-      fontFamily: 'system-ui, sans-serif',
-      fontSize: '11px',
-      color: '#111827',
-      backgroundColor: '#ffd166',
-      padding: { x: 12, y: 9 },
-      fontStyle: '900'
-    }).setOrigin(1, 0).setScrollFactor(0).setDepth(101).setInteractive({ useHandCursor: true });
+    this.toast = this.add.text(GAME_W / 2, 132, 'Swipe to turn', {
+      fontFamily: 'system-ui', fontSize: '13px', color: '#fff', backgroundColor: '#111827cc', padding: { x: 13, y: 8 }
+    }).setOrigin(0.5).setScrollFactor(0).setDepth(205);
+    this.time.delayedCall(2600, () => this.toast?.setVisible(false));
 
-    this.themeButton.on('pointerdown', () => this.switchTheme());
+    this.buildQuizUI();
+    this.buildGameOverUI();
+  }
 
-    this.messageText = this.add.text(GAME_W / 2, 118, 'Drag anywhere to steer', {
-      fontFamily: 'system-ui, sans-serif',
-      fontSize: '14px',
-      color: '#ffffff',
-      backgroundColor: '#111827bb',
-      padding: { x: 14, y: 8 }
-    }).setOrigin(0.5).setScrollFactor(0).setDepth(102);
+  buildQuizUI() {
+    this.quizUI = [];
+    const dim = this.add.rectangle(GAME_W / 2, GAME_H / 2, GAME_W, GAME_H, 0x090b12, 0.68).setScrollFactor(0).setDepth(500).setVisible(false);
+    const card = this.add.rectangle(GAME_W / 2, GAME_H / 2, GAME_W - 44, 420, 0x1b2030, 0.98).setStrokeStyle(2, 0x7c6cff, 0.85).setScrollFactor(0).setDepth(501).setVisible(false);
+    this.quizTitle = this.add.text(GAME_W / 2, 226, 'BLACK BOX QUIZ', { fontFamily: 'system-ui', fontSize: '18px', fontStyle: '900', color: '#c5baff' }).setOrigin(0.5).setScrollFactor(0).setDepth(502).setVisible(false);
+    this.quizTimer = this.add.text(GAME_W / 2, 260, '15', { fontFamily: 'system-ui', fontSize: '32px', fontStyle: '900', color: '#fff' }).setOrigin(0.5).setScrollFactor(0).setDepth(502).setVisible(false);
+    this.quizQuestion = this.add.text(GAME_W / 2, 322, '', { fontFamily: 'system-ui', fontSize: '19px', fontStyle: '700', color: '#fff', align: 'center', wordWrap: { width: GAME_W - 90 } }).setOrigin(0.5).setScrollFactor(0).setDepth(502).setVisible(false);
+    this.quizOptions = [];
+    for (let i = 0; i < 3; i++) {
+      const t = this.add.text(GAME_W / 2, 405 + i * 66, '', {
+        fontFamily: 'system-ui', fontSize: '16px', fontStyle: '800', color: '#111827', backgroundColor: '#f4f0ff',
+        padding: { x: 18, y: 13 }, align: 'center', fixedWidth: GAME_W - 92
+      }).setOrigin(0.5).setScrollFactor(0).setDepth(503).setVisible(false).setInteractive({ useHandCursor: true });
+      t.on('pointerdown', () => this.answerQuiz(i));
+      this.quizOptions.push(t);
+    }
+    this.quizUI = [dim, card, this.quizTitle, this.quizTimer, this.quizQuestion, ...this.quizOptions];
+  }
 
-    this.time.delayedCall(3000, () => {
-      if (this.messageText) this.messageText.setVisible(false);
-    });
-
-    this.joystickGraphics = this.add.graphics().setScrollFactor(0).setDepth(103);
+  buildGameOverUI() {
+    this.overUI = [];
+    const dim = this.add.rectangle(GAME_W / 2, GAME_H / 2, GAME_W, GAME_H, 0x061007, 0.76).setScrollFactor(0).setDepth(700).setVisible(false);
+    const card = this.add.rectangle(GAME_W / 2, GAME_H / 2, GAME_W - 54, 330, 0x17341e, 0.98).setStrokeStyle(2, 0xffffff, 0.15).setScrollFactor(0).setDepth(701).setVisible(false);
+    this.overTitle = this.add.text(GAME_W / 2, 300, 'TIME!', { fontFamily: 'system-ui', fontSize: '34px', fontStyle: '900', color: '#fff' }).setOrigin(0.5).setScrollFactor(0).setDepth(702).setVisible(false);
+    this.overScore = this.add.text(GAME_W / 2, 370, '', { fontFamily: 'system-ui', fontSize: '20px', fontStyle: '800', color: '#d9f99d', align: 'center' }).setOrigin(0.5).setScrollFactor(0).setDepth(702).setVisible(false);
+    const btn = this.add.text(GAME_W / 2, 505, 'BACK TO HOME', { fontFamily: 'system-ui', fontSize: '15px', fontStyle: '900', color: '#17341e', backgroundColor: '#d9f99d', padding: { x: 22, y: 13 } }).setOrigin(0.5).setScrollFactor(0).setDepth(703).setVisible(false).setInteractive({ useHandCursor: true });
+    btn.on('pointerdown', () => this.scene.restart());
+    this.overUI = [dim, card, this.overTitle, this.overScore, btn];
   }
 
   bindInput() {
-    this.keys = this.input.keyboard.addKeys({
-      up: Phaser.Input.Keyboard.KeyCodes.UP,
-      down: Phaser.Input.Keyboard.KeyCodes.DOWN,
-      left: Phaser.Input.Keyboard.KeyCodes.LEFT,
-      right: Phaser.Input.Keyboard.KeyCodes.RIGHT,
-      w: Phaser.Input.Keyboard.KeyCodes.W,
-      a: Phaser.Input.Keyboard.KeyCodes.A,
-      s: Phaser.Input.Keyboard.KeyCodes.S,
-      d: Phaser.Input.Keyboard.KeyCodes.D
+    this.keys = this.input.keyboard.addKeys({ up: 'UP', down: 'DOWN', left: 'LEFT', right: 'RIGHT', w: 'W', a: 'A', s: 'S', d: 'D' });
+    this.input.on('pointerdown', p => {
+      if (this.gameOver || this.quiz) return;
+      if (this.skinButton.getBounds().contains(p.x, p.y)) return;
+      this.swipeStart = { x: p.x, y: p.y };
     });
-
-    this.input.on('pointerdown', (pointer) => {
-      if (this.themeButton && this.themeButton.getBounds().contains(pointer.x, pointer.y)) return;
-
-      if (this.isGameOver) {
-        this.scene.restart();
-        return;
-      }
-
-      this.joystickActive = true;
-      this.joystickPointerId = pointer.id;
-      this.joystickOrigin.set(pointer.x, pointer.y);
-      this.updateJoystick(pointer.x, pointer.y);
+    this.input.on('pointermove', p => {
+      if (!p.isDown || !this.swipeStart || this.quiz || this.gameOver) return;
+      const dx = p.x - this.swipeStart.x, dy = p.y - this.swipeStart.y;
+      if (Math.hypot(dx, dy) < 28) return;
+      this.queueSwipe(dx, dy);
+      this.swipeStart = { x: p.x, y: p.y };
     });
-
-    this.input.on('pointermove', (pointer) => {
-      if (this.joystickActive && pointer.id === this.joystickPointerId && pointer.isDown) {
-        this.updateJoystick(pointer.x, pointer.y);
-      }
-    });
-
-    const release = (pointer) => {
-      if (pointer.id !== this.joystickPointerId) return;
-      this.joystickActive = false;
-      this.joystickPointerId = null;
-      this.pointerDirection.set(0, 0);
-      this.joystickGraphics.clear();
-    };
-
-    this.input.on('pointerup', release);
-    this.input.on('pointerupoutside', release);
+    this.input.on('pointerup', () => { this.swipeStart = null; });
   }
 
-  updateJoystick(x, y) {
-    const dx = x - this.joystickOrigin.x;
-    const dy = y - this.joystickOrigin.y;
-    const max = 58;
-    const len = Math.hypot(dx, dy);
-
-    if (len > 7) this.pointerDirection.set(dx / len, dy / len);
-
-    const scale = len > max ? max / len : 1;
-    const kx = this.joystickOrigin.x + dx * scale;
-    const ky = this.joystickOrigin.y + dy * scale;
-
-    this.joystickGraphics.clear();
-    this.joystickGraphics.fillStyle(0x111827, 0.20).fillCircle(this.joystickOrigin.x, this.joystickOrigin.y, 42);
-    this.joystickGraphics.lineStyle(2, 0xffffff, 0.28).strokeCircle(this.joystickOrigin.x, this.joystickOrigin.y, 42);
-    this.joystickGraphics.fillStyle(0xffffff, 0.72).fillCircle(kx, ky, 18);
+  queueSwipe(dx, dy) {
+    const dir = Math.abs(dx) > Math.abs(dy) ? (dx > 0 ? DIRS[1] : DIRS[3]) : (dy > 0 ? DIRS[2] : DIRS[0]);
+    this.queueDirection(this.player, dir);
   }
 
-  readDirectionInput() {
-    const v = new Phaser.Math.Vector2(0, 0);
-    if (this.keys.left.isDown || this.keys.a.isDown) v.x -= 1;
-    if (this.keys.right.isDown || this.keys.d.isDown) v.x += 1;
-    if (this.keys.up.isDown || this.keys.w.isDown) v.y -= 1;
-    if (this.keys.down.isDown || this.keys.s.isDown) v.y += 1;
-
-    if (v.lengthSq() > 0) {
-      this.targetDirection.copy(v.normalize());
-    } else if (this.joystickActive && this.pointerDirection.lengthSq() > 0.01) {
-      this.targetDirection.copy(this.pointerDirection);
-    }
-  }
-
-  movePlayer(time, dt) {
-    const blend = 1 - Math.exp(-7.5 * dt);
-    this.direction.x = Phaser.Math.Linear(this.direction.x, this.targetDirection.x, blend);
-    this.direction.y = Phaser.Math.Linear(this.direction.y, this.targetDirection.y, blend);
-    if (this.direction.lengthSq() < 0.01) this.direction.set(0, -1);
-    this.direction.normalize();
-
-    const boosting = time < this.boostUntil;
-    const speed = this.baseSpeed * (boosting ? 1.35 : 1);
-
-    this.head.x += this.direction.x * speed * dt;
-    this.head.y += this.direction.y * speed * dt;
-
-    if (this.head.x < 34 || this.head.x > WORLD_W - 34) this.targetDirection.x *= -1;
-    if (this.head.y < 34 || this.head.y > WORLD_H - 34) this.targetDirection.y *= -1;
-
-    this.head.x = Phaser.Math.Clamp(this.head.x, 34, WORLD_W - 34);
-    this.head.y = Phaser.Math.Clamp(this.head.y, 34, WORLD_H - 34);
-    this.head.rotation = Math.atan2(this.direction.y, this.direction.x) + Math.PI / 2;
-
-    this.headDecoration.setPosition(this.head.x, this.head.y);
-    this.headDecoration.setRotation(this.theme.id === 'snake' ? this.head.rotation : 0);
-
-    const last = this.trail[0];
-    if (!last || Phaser.Math.Distance.Between(last.x, last.y, this.head.x, this.head.y) > 4) {
-      this.trail.unshift({ x: this.head.x, y: this.head.y });
-      if (this.trail.length > 1200) this.trail.pop();
-    }
-  }
-
-  updateChain() {
-    const spacing = this.theme.id === 'shopping' ? 31 : 27;
-
-    this.segments.forEach((seg, index) => {
-      const p = this.sampleTrail((index + 1) * spacing);
-      if (!p) return;
-      seg.sprite.x = Phaser.Math.Linear(seg.sprite.x, p.x, 0.56);
-      seg.sprite.y = Phaser.Math.Linear(seg.sprite.y, p.y, 0.56);
-      if (seg.label) seg.label.setPosition(seg.sprite.x, seg.sprite.y);
-    });
-  }
-
-  sampleTrail(distance) {
-    let walked = 0;
-
-    for (let i = 1; i < this.trail.length; i++) {
-      const a = this.trail[i - 1];
-      const b = this.trail[i];
-      const d = Phaser.Math.Distance.Between(a.x, a.y, b.x, b.y);
-
-      if (walked + d >= distance) {
-        const t = (distance - walked) / Math.max(d, 0.001);
-        return {
-          x: Phaser.Math.Linear(a.x, b.x, t),
-          y: Phaser.Math.Linear(a.y, b.y, t)
-        };
-      }
-
-      walked += d;
-    }
-
-    return this.trail[this.trail.length - 1];
-  }
-
-  handleCollectibles(time) {
-    this.collectibles.forEach((item) => {
-      if (Phaser.Math.Distance.Between(this.head.x, this.head.y, item.sprite.x, item.sprite.y) > 38) return;
-
-      if (item.kind === 'common') {
-        this.score += 10;
-        this.addSegment();
-        this.flashMessage('+10 · chain grew');
-      } else if (item.kind === 'power') {
-        this.score += 50;
-        this.addSegment();
-        this.boostUntil = time + 4500;
-        this.flashMessage('Speed boost!');
-      } else {
-        const roll = Phaser.Math.Between(0, 2);
-
-        if (roll === 0) {
-          this.shield = 1;
-          this.flashMessage('Mystery: shield');
-        } else if (roll === 1) {
-          this.score += 120;
-          this.flashMessage('Mystery: +120');
-        } else {
-          this.addSegment();
-          this.addSegment();
-          this.flashMessage('Mystery: +2 chain');
-        }
-      }
-
-      this.spawnCollectible(item.kind, item);
-    });
-  }
-
-  handleObstacleCollision(time) {
-    if (time < this.invulnerableUntil) return;
-
-    const circle = new Phaser.Geom.Circle(this.head.x, this.head.y, 19);
-    const hit = this.obstacles.some((rect) => Phaser.Geom.Intersects.CircleToRectangle(circle, rect));
-    if (!hit) return;
-
-    this.invulnerableUntil = time + 950;
-    this.head.setAlpha(0.45);
-    this.time.delayedCall(900, () => {
-      if (this.head) this.head.setAlpha(1);
-    });
-
-    this.head.x -= this.direction.x * 46;
-    this.head.y -= this.direction.y * 46;
-    this.targetDirection.scale(-1);
-
-    if (this.shield > 0) {
-      this.shield = 0;
-      this.flashMessage('Shield saved you');
-      return;
-    }
-
-    if (this.segments.length > 2) {
-      this.removeSegments(2);
-      this.score = Math.max(0, this.score - 20);
-      this.flashMessage('Hit! -2 chain');
-    } else {
-      this.gameOver();
-    }
+  queueDirection(snake, dir) {
+    if (!opposite(dir, snake.dir)) snake.queuedDir = { x: dir.x, y: dir.y };
   }
 
   configureCamera() {
-    this.focusTarget = this.add.zone(this.head.x, this.head.y, 2, 2);
-    const camera = this.cameras.main;
-    camera.setBounds(0, 0, WORLD_W, WORLD_H);
-    camera.startFollow(this.focusTarget, true, 0.11, 0.11);
-    camera.setZoom(0.98);
+    this.cameraFocus = this.add.zone(centerOf(this.player.positions[0]).x, centerOf(this.player.positions[0]).y, 2, 2);
+    this.cameras.main.setBounds(0, 0, WORLD_W, WORLD_H).startFollow(this.cameraFocus, true, 0.12, 0.12).setZoom(1.02);
+  }
+
+  update(time, delta) {
+    if (this.gameOver) return;
+    if (time >= this.gameEndsAt) { this.finishGame(); return; }
+
+    this.readKeyboard();
+    this.updateQuiz(time);
+    this.updateSpawns(time);
+    this.updatePoison(time);
+
+    for (const snake of this.snakes) {
+      if (snake.isPlayer && this.quiz) continue;
+      if (time < snake.stunnedUntil) continue;
+      snake.elapsed += delta;
+      const interval = snake.stepMs * (time < snake.slowedUntil ? 1.7 : 1);
+      if (snake.elapsed >= interval) {
+        snake.elapsed -= interval;
+        if (!snake.isPlayer) this.chooseBotDirection(snake);
+        this.stepSnake(snake, time);
+      }
+      const t = Phaser.Math.Clamp(snake.elapsed / interval, 0, 1);
+      this.renderSnake(snake, t, time);
+    }
+
+    this.updateCamera(time);
+    this.updateHUD(time);
+  }
+
+  readKeyboard() {
+    if (this.quiz) return;
+    if (Phaser.Input.Keyboard.JustDown(this.keys.up) || Phaser.Input.Keyboard.JustDown(this.keys.w)) this.queueDirection(this.player, DIRS[0]);
+    if (Phaser.Input.Keyboard.JustDown(this.keys.right) || Phaser.Input.Keyboard.JustDown(this.keys.d)) this.queueDirection(this.player, DIRS[1]);
+    if (Phaser.Input.Keyboard.JustDown(this.keys.down) || Phaser.Input.Keyboard.JustDown(this.keys.s)) this.queueDirection(this.player, DIRS[2]);
+    if (Phaser.Input.Keyboard.JustDown(this.keys.left) || Phaser.Input.Keyboard.JustDown(this.keys.a)) this.queueDirection(this.player, DIRS[3]);
+  }
+
+  stepSnake(snake, time) {
+    snake.dir = { ...snake.queuedDir };
+    const head = snake.positions[0];
+    const next = { x: head.x + snake.dir.x, y: head.y + snake.dir.y };
+
+    const hitWorld = next.x < 0 || next.y < 0 || next.x >= COLS || next.y >= ROWS || this.walls.has(tileKey(next.x, next.y));
+    const hitSelf = snake.positions.slice(1, -1).some(p => sameTile(p, next));
+    const hitOther = this.snakes.find(s => s !== snake && s.positions.some(p => sameTile(p, next)));
+
+    if (hitWorld || hitSelf || hitOther) {
+      if (hitOther && time < snake.spikeUntil) this.damageSnake(hitOther, 1, true);
+      if (hitOther && time < hitOther.spikeUntil) this.damageSnake(snake, 1, true);
+      this.handleCollision(snake);
+      return;
+    }
+
+    const old = snake.positions.map(p => ({ ...p }));
+    snake.prevPositions = old;
+    snake.positions.unshift(next);
+    snake.positions.pop();
+
+    if (snake.isPlayer && time < snake.venomUntil) this.addPoison(old[old.length - 1], time);
+    if (!snake.isPlayer && this.isPoison(next)) {
+      this.damageSnake(snake, 1, false);
+      snake.stunnedUntil = time + 3000;
+    }
+
+    this.collectAt(snake, next, old, time);
+    this.syncSnakeSprites(snake);
+  }
+
+  handleCollision(snake) {
+    this.damageSnake(snake, 1, false);
+    const options = DIRS.filter(d => !opposite(d, snake.dir) && this.isSafeNext(snake, d));
+    if (options.length) snake.queuedDir = { ...Phaser.Utils.Array.GetRandom(options) };
+    if (snake.isPlayer) {
+      this.cameras.main.shake(130, 0.008);
+      this.flash('BUMP! -1 tail');
+    }
+  }
+
+  damageSnake(snake, count, bounce) {
+    let removed = 0;
+    while (count-- > 0 && snake.positions.length > 2) {
+      snake.positions.pop();
+      snake.prevPositions.pop();
+      removed++;
+    }
+    if (removed) snake.score = Math.max(0, snake.score - removed * 10);
+    this.syncSnakeSprites(snake);
+    if (bounce) snake.stunnedUntil = this.time.now + 700;
+  }
+
+  isSafeNext(snake, dir) {
+    const h = snake.positions[0], n = { x: h.x + dir.x, y: h.y + dir.y };
+    if (n.x < 0 || n.y < 0 || n.x >= COLS || n.y >= ROWS || this.walls.has(tileKey(n.x, n.y))) return false;
+    return !snake.positions.slice(1, -1).some(p => sameTile(p, n));
+  }
+
+  chooseBotDirection(snake) {
+    const targetItem = this.closestCollectible(snake.positions[0]);
+    const candidates = DIRS.filter(d => !opposite(d, snake.dir) && this.isSafeNext(snake, d));
+    if (!candidates.length) return;
+    if (!targetItem || Math.random() < 0.16) {
+      snake.queuedDir = { ...Phaser.Utils.Array.GetRandom(candidates) };
+      return;
+    }
+    candidates.sort((a, b) => {
+      const h = snake.positions[0];
+      const da = Math.abs(h.x + a.x - targetItem.tile.x) + Math.abs(h.y + a.y - targetItem.tile.y);
+      const db = Math.abs(h.x + b.x - targetItem.tile.x) + Math.abs(h.y + b.y - targetItem.tile.y);
+      return da - db;
+    });
+    snake.queuedDir = { ...candidates[0] };
+  }
+
+  closestCollectible(tile) {
+    const items = [];
+    if (this.apple) items.push(this.apple);
+    if (this.blackBox) items.push(this.blackBox);
+    items.push(...this.stars);
+    if (!items.length) return null;
+    return items.reduce((best, item) => {
+      const d = Math.abs(tile.x - item.tile.x) + Math.abs(tile.y - item.tile.y);
+      return !best || d < best.d ? { ...item, d } : best;
+    }, null);
+  }
+
+  renderSnake(snake, t, time = this.time.now) {
+    const visibleAlpha = time < snake.invisibleUntil ? 0.36 : 1;
+    snake.sprites.forEach((sprite, i) => {
+      const from = snake.prevPositions[Math.min(i, snake.prevPositions.length - 1)] || snake.positions[i];
+      const to = snake.positions[i] || from;
+      const a = centerOf(from), b = centerOf(to);
+      sprite.setPosition(Phaser.Math.Linear(a.x, b.x, t), Phaser.Math.Linear(a.y, b.y, t));
+      sprite.setAlpha(this.quiz && snake.isPlayer ? 0 : visibleAlpha);
+
+      if (i === 0) sprite.setRotation(headRotation(snake.dir));
+      else if (i === snake.positions.length - 1) {
+        const prev = snake.positions[Math.max(0, i - 1)];
+        sprite.setRotation(tailRotation({ x: to.x - prev.x, y: to.y - prev.y }));
+      } else {
+        const prev = snake.positions[i - 1], next = snake.positions[i + 1];
+        const d = { x: next.x - prev.x, y: next.y - prev.y };
+        sprite.setRotation(Math.atan2(d.y, d.x) + Math.PI / 2);
+      }
+      if (i === 0 && time < snake.spikeUntil) sprite.setTint(0xffef7a); else sprite.clearTint();
+    });
+  }
+
+  collectAt(snake, tile, oldPositions, time) {
+    if (this.apple && sameTile(this.apple.tile, tile)) {
+      this.destroyItem(this.apple); this.apple = null;
+      this.growSnake(snake, 1, oldPositions);
+      snake.score += 10;
+      if (snake.isPlayer) this.appleCombo(time);
+      this.time.delayedCall(2000, () => { if (!this.gameOver && !this.apple) this.spawnApple(); });
+    }
+
+    const star = this.stars.find(s => sameTile(s.tile, tile));
+    if (star) {
+      this.destroyItem(star);
+      this.stars = this.stars.filter(s => s !== star);
+      this.growSnake(snake, 2, oldPositions);
+      snake.score += 20;
+      if (snake.isPlayer) this.flash('★ +20 · +2 length');
+    }
+
+    if (this.blackBox && sameTile(this.blackBox.tile, tile)) {
+      if (snake.isPlayer) this.startQuiz(time);
+      else this.activateSkill(snake, Phaser.Utils.Array.GetRandom(SKILLS), time);
+      this.destroyItem(this.blackBox); this.blackBox = null;
+    }
+  }
+
+  growSnake(snake, count, oldPositions) {
+    let tail = oldPositions[oldPositions.length - 1] || snake.positions[snake.positions.length - 1];
+    while (count-- > 0) snake.positions.push({ ...tail });
+    snake.prevPositions = snake.prevPositions.concat(Array(snake.positions.length - snake.prevPositions.length).fill(0).map(() => ({ ...tail })));
+    this.syncSnakeSprites(snake);
+  }
+
+  appleCombo(time) {
+    if (this.comboDeadline && time > this.comboDeadline) this.comboCount = 0;
+    this.comboCount++;
+    this.highestCombo = Math.max(this.highestCombo, this.comboCount);
+    this.comboDeadline = time + COMBO_WINDOW_MS;
+    if (this.comboCount >= 5) {
+      this.comboCount = 0;
+      this.comboDeadline = 0;
+      this.startStarRush(time);
+    } else this.flash(`Apple combo ${this.comboCount}/5`);
+  }
+
+  startStarRush(time) {
+    this.starRushUntil = time + 30000;
+    this.clearStars();
+    for (let i = 0; i < 25; i++) this.spawnStar();
+    this.flash('STAR RUSH! 25 stars · 30s', 1800);
+    this.cameras.main.flash(220, 255, 226, 92, false);
+  }
+
+  updateSpawns(time) {
+    if (this.comboDeadline && time > this.comboDeadline) { this.comboCount = 0; this.comboDeadline = 0; }
+    if (this.starRushUntil && time > this.starRushUntil) { this.starRushUntil = 0; this.clearStars(); }
+    if (!this.blackBox && time - this.lastBlackBoxSpawn >= 10000) this.spawnBlackBox();
+  }
+
+  spawnApple() {
+    if (this.apple || this.gameOver) return;
+    this.apple = this.spawnItem('apple');
+    this.apple.expireEvent = this.time.delayedCall(5000, () => {
+      if (!this.apple) return;
+      this.destroyItem(this.apple); this.apple = null;
+      this.time.delayedCall(2000, () => this.spawnApple());
+    });
+  }
+
+  spawnBlackBox() {
+    if (this.blackBox || this.gameOver) return;
+    this.lastBlackBoxSpawn = this.time.now;
+    this.blackBox = this.spawnItem('blackbox');
+    const target = this.blackBox;
+    target.expireEvent = this.time.delayedCall(4000, () => {
+      if (this.blackBox !== target) return;
+      this.destroyItem(target); this.blackBox = null;
+    });
+  }
+
+  spawnStar() { this.stars.push(this.spawnItem('star')); }
+
+  spawnItem(type) {
+    const tile = this.randomFreeTile();
+    const c = centerOf(tile);
+    const sprite = this.add.sprite(c.x, c.y, type).setDepth(8);
+    if (type === 'star') this.tweens.add({ targets: sprite, angle: 360, duration: 1500, repeat: -1 });
+    if (type === 'blackbox') {
+      this.tweens.add({ targets: sprite, scale: 1.12, duration: 520, yoyo: true, repeat: -1 });
+      const q = this.add.text(c.x, c.y - 2, '?', { fontFamily: 'system-ui', fontSize: '28px', fontStyle: '900', color: '#fff' }).setOrigin(0.5).setDepth(9);
+      return { type, tile, sprite, label: q };
+    }
+    return { type, tile, sprite };
+  }
+
+  destroyItem(item) {
+    if (!item) return;
+    if (item.expireEvent) item.expireEvent.remove(false);
+    item.sprite?.destroy(); item.label?.destroy();
+  }
+
+  clearStars() { this.stars.forEach(s => this.destroyItem(s)); this.stars = []; }
+
+  randomFreeTile() {
+    for (let i = 0; i < 250; i++) {
+      const tile = { x: Phaser.Math.Between(2, COLS - 3), y: Phaser.Math.Between(2, ROWS - 3) };
+      if (this.walls.has(tileKey(tile.x, tile.y))) continue;
+      if (this.snakes?.some(s => s.positions.some(p => sameTile(p, tile)))) continue;
+      if (this.apple && sameTile(this.apple.tile, tile)) continue;
+      if (this.blackBox && sameTile(this.blackBox.tile, tile)) continue;
+      if (this.stars?.some(s => sameTile(s.tile, tile))) continue;
+      return tile;
+    }
+    return { x: 30, y: 20 };
+  }
+
+  startQuiz(time) {
+    const q = Phaser.Utils.Array.GetRandom(QUIZ_BANK);
+    this.quiz = { ...q, startedAt: time, endsAt: time + 15000 };
+    this.quizOrb.setPosition(this.player.sprites[0].x, this.player.sprites[0].y).setVisible(true);
+    this.quizUI.forEach(x => x.setVisible(true));
+    this.quizQuestion.setText(q.q);
+    q.options.forEach((o, i) => this.quizOptions[i].setText(o));
+    this.quizTimer.setText('15');
+  }
+
+  updateQuiz(time) {
+    if (!this.quiz) return;
+    const left = Math.max(0, Math.ceil((this.quiz.endsAt - time) / 1000));
+    this.quizTimer.setText(String(left));
+    if (time >= this.quiz.endsAt) this.finishQuiz(false, time, true);
+  }
+
+  answerQuiz(index) {
+    if (!this.quiz) return;
+    this.finishQuiz(index === this.quiz.answer, this.time.now, false);
+  }
+
+  finishQuiz(correct, time, timedOut) {
+    this.quiz = null;
+    this.quizUI.forEach(x => x.setVisible(false));
+    this.quizOrb.setVisible(false);
+    this.player.invisibleUntil = time + 8000;
+    if (correct) {
+      const skill = Phaser.Utils.Array.GetRandom(SKILLS);
+      this.activateSkill(this.player, skill, time);
+      this.flash(`${skill}! 8s power-up`, 1700);
+    } else this.flash(timedOut ? 'Quiz time out · no power-up' : 'Wrong answer · no power-up', 1600);
+  }
+
+  activateSkill(snake, skill, time) {
+    if (snake.isPlayer) this.activeSkillLabel = skill.toUpperCase();
+    if (skill === 'Slow') {
+      this.snakes.filter(s => s !== snake).forEach(s => s.slowedUntil = Math.max(s.slowedUntil, time + 8000));
+    } else if (skill === 'Fire') {
+      this.castFire(snake, time);
+    } else if (skill === 'Grapple Tongue') {
+      this.castGrapple(snake, time);
+    } else if (skill === 'Venom Trail') {
+      snake.venomUntil = time + 10000;
+    } else if (skill === 'Spike Skin') {
+      snake.spikeUntil = time + 8000;
+    }
+    this.time.delayedCall(8000, () => { if (snake.isPlayer && this.activeSkillLabel === skill.toUpperCase()) this.activeSkillLabel = ''; });
+  }
+
+  castFire(snake, time) {
+    const h = snake.positions[0];
+    const end = { x: h.x + snake.dir.x * 6, y: h.y + snake.dir.y * 6 };
+    const a = centerOf(h), b = centerOf(end);
+    this.effectGfx.lineStyle(22, 0xff6b24, 0.88).lineBetween(a.x, a.y, b.x, b.y);
+    this.effectGfx.lineStyle(8, 0xffd166, 0.96).lineBetween(a.x, a.y, b.x, b.y);
+    this.time.delayedCall(550, () => this.effectGfx.clear());
+    this.snakes.filter(s => s !== snake).forEach(target => {
+      const p = target.positions[0];
+      const aligned = snake.dir.x !== 0 ? p.y === h.y && (p.x - h.x) * snake.dir.x > 0 && Math.abs(p.x - h.x) <= 6
+        : p.x === h.x && (p.y - h.y) * snake.dir.y > 0 && Math.abs(p.y - h.y) <= 6;
+      if (aligned) {
+        const before = target.positions.length;
+        this.damageSnake(target, 3, true);
+        snake.score += Math.max(0, before - target.positions.length) * 5;
+      }
+    });
+  }
+
+  castGrapple(snake) {
+    const h = snake.positions[0];
+    const candidates = [];
+    if (this.apple) candidates.push(this.apple);
+    candidates.push(...this.stars);
+    const target = candidates.map(item => ({ item, d: Math.abs(item.tile.x - h.x) + Math.abs(item.tile.y - h.y) }))
+      .filter(x => x.d <= 5).sort((a, b) => a.d - b.d)[0];
+    if (!target) return;
+    const a = centerOf(h), b = centerOf(target.item.tile);
+    const tongue = this.add.sprite(a.x, a.y, 'snakeParts', FRAME.tongue).setDepth(42).setDisplaySize(18, Phaser.Math.Distance.Between(a.x, a.y, b.x, b.y));
+    tongue.setOrigin(0.5, 1).setRotation(Math.atan2(b.y - a.y, b.x - a.x) - Math.PI / 2);
+    this.tweens.add({ targets: tongue, alpha: 0, duration: 420, onComplete: () => tongue.destroy() });
+    if (target.item === this.apple) {
+      this.destroyItem(this.apple); this.apple = null; this.growSnake(snake, 1, snake.positions); snake.score += 10;
+      if (snake.isPlayer) this.appleCombo(this.time.now);
+      this.time.delayedCall(2000, () => this.spawnApple());
+    } else {
+      this.destroyItem(target.item); this.stars = this.stars.filter(s => s !== target.item); this.growSnake(snake, 2, snake.positions); snake.score += 20;
+    }
+  }
+
+  addPoison(tile, time) {
+    if (this.poisonTiles.some(p => sameTile(p.tile, tile))) return;
+    const c = centerOf(tile);
+    const sprite = this.add.sprite(c.x, c.y, 'poison').setDepth(5);
+    this.poisonTiles.push({ tile: { ...tile }, sprite, expires: time + 10000 });
+    while (this.poisonTiles.length > 12) this.poisonTiles.shift().sprite.destroy();
+  }
+
+  isPoison(tile) { return this.poisonTiles.some(p => sameTile(p.tile, tile)); }
+  updatePoison(time) {
+    this.poisonTiles = this.poisonTiles.filter(p => { if (p.expires <= time) { p.sprite.destroy(); return false; } return true; });
+  }
+
+  cycleSkin() {
+    const idx = (SKINS.indexOf(this.player.skin) + 1) % SKINS.length;
+    this.player.skin = SKINS[idx];
+    this.skinButton.setText(this.player.skin.toUpperCase());
+    const colors = { beige: '#f2eadc', white: '#e9f7f8', green: '#66dc7a', red: '#ff7566' };
+    this.skinButton.setBackgroundColor(colors[this.player.skin]);
+    this.syncSnakeSprites(this.player);
   }
 
   updateCamera(time) {
-    const lookAhead = time < this.boostUntil ? 155 : 118;
-    const desiredX = this.head.x + this.direction.x * lookAhead;
-    const desiredY = this.head.y + this.direction.y * lookAhead;
-
-    this.focusTarget.x = Phaser.Math.Linear(this.focusTarget.x, desiredX, 0.085);
-    this.focusTarget.y = Phaser.Math.Linear(this.focusTarget.y, desiredY, 0.085);
-
-    let targetZoom = 1.03 - Math.max(0, this.segments.length - 4) * 0.018;
-    if (time < this.boostUntil) targetZoom -= 0.08;
-    targetZoom = Phaser.Math.Clamp(targetZoom, 0.70, 1.04);
-
+    const sprite = this.player.sprites[0];
+    const look = TILE * 1.55;
+    const tx = sprite.x + this.player.dir.x * look;
+    const ty = sprite.y + this.player.dir.y * look;
+    this.cameraFocus.x = Phaser.Math.Linear(this.cameraFocus.x, tx, 0.08);
+    this.cameraFocus.y = Phaser.Math.Linear(this.cameraFocus.y, ty, 0.08);
+    let targetZoom = 1.05 - Math.max(0, this.player.positions.length - 2) * 0.018;
+    if (this.starRushUntil > time) targetZoom -= 0.10;
+    targetZoom = Phaser.Math.Clamp(targetZoom, 0.68, 1.05);
     this.cameras.main.setZoom(Phaser.Math.Linear(this.cameras.main.zoom, targetZoom, 0.035));
   }
 
-  updateUI(time) {
-    this.scoreText.setText('Score ' + this.score);
-    const boost = time < this.boostUntil ? ' · BOOST' : '';
-    const shield = this.shield ? ' · SHIELD' : '';
-    this.statusText.setText('Length ' + this.segments.length + boost + shield);
+  updateHUD(time) {
+    const remain = Math.max(0, this.gameEndsAt - time);
+    const sec = Math.ceil(remain / 1000);
+    this.timerText.setText(`${Math.floor(sec / 60)}:${String(sec % 60).padStart(2, '0')}`);
+    this.scoreText.setText(`🍎 ${this.player.score}`);
+    const sorted = [...this.snakes].sort((a, b) => b.score - a.score);
+    this.rankText.setText(`#${sorted.indexOf(this.player) + 1}`);
+    this.comboText.setText(this.starRushUntil > time ? `★ STAR RUSH ${Math.ceil((this.starRushUntil - time) / 1000)}s` : `COMBO ${this.comboCount}/5`);
+    this.skillText.setText(this.activeSkillLabel);
   }
 
-  switchTheme() {
-    this.themeId = this.themeId === 'snake' ? 'shopping' : 'snake';
-    this.theme = THEME_PACKS[this.themeId];
-    this.redrawWorld();
-
-    this.head.setTexture(this.theme.id + '-head');
-    this.headDecoration.setText(this.theme.id === 'snake' ? '••' : '👩');
-    this.headDecoration.setFontSize(this.theme.id === 'snake' ? 15 : 25);
-    this.headDecoration.setColor(this.theme.id === 'snake' ? '#ffffff' : '#3f2a35');
-
-    this.segments.forEach((seg, i) => {
-      seg.sprite.setTexture(this.theme.id + '-body-' + (i % this.theme.bodyPalette.length));
-
-      if (this.theme.id === 'shopping') {
-        if (!seg.label) seg.label = this.makeSegmentLabel(seg.sprite, i);
-        seg.label.setText(this.theme.segmentLabels[i % this.theme.segmentLabels.length]);
-      } else if (seg.label) {
-        seg.label.destroy();
-        seg.label = null;
-      }
-    });
-
-    this.collectibles.forEach((item) => {
-      item.type = this.theme.collectible[item.kind];
-      item.sprite.setTexture('item-' + item.type);
-    });
-
-    this.themeButton.setText(this.theme.id === 'snake' ? 'SHOPPING' : 'SNAKE');
-    this.themeButton.setBackgroundColor(this.theme.id === 'snake' ? '#ffd166' : '#a7e8bd');
-    this.flashMessage(this.theme.name);
+  flash(text, duration = 1100) {
+    this.toast.setText(text).setVisible(true).setAlpha(1);
+    this.tweens.killTweensOf(this.toast);
+    this.tweens.add({ targets: this.toast, alpha: 0, delay: duration, duration: 350, onComplete: () => this.toast.setVisible(false).setAlpha(1) });
   }
 
-  flashMessage(text) {
-    this.messageText.setText(text).setPosition(GAME_W / 2, 118).setVisible(true).setAlpha(1);
-    this.tweens.killTweensOf(this.messageText);
-    this.tweens.add({
-      targets: this.messageText,
-      alpha: 0,
-      delay: 900,
-      duration: 450,
-      onComplete: () => this.messageText.setVisible(false).setAlpha(1)
-    });
-  }
-
-  gameOver() {
-    this.isGameOver = true;
-    this.joystickGraphics.clear();
-    this.messageText
-      .setText('Game over · Score ' + this.score + '\nTap to restart')
-      .setStyle({
-        fontFamily: 'system-ui, sans-serif',
-        fontSize: '22px',
-        align: 'center',
-        color: '#ffffff',
-        backgroundColor: '#111827dd',
-        padding: { x: 22, y: 18 }
-      })
-      .setPosition(GAME_W / 2, GAME_H / 2)
-      .setOrigin(0.5)
-      .setVisible(true)
-      .setAlpha(1);
+  finishGame() {
+    this.gameOver = true;
+    this.overScore.setText(`Score  ${this.player.score}\nHighest Combo  ${this.highestCombo}`);
+    this.overUI.forEach(x => x.setVisible(true));
   }
 }
 
@@ -621,14 +700,8 @@ new Phaser.Game({
   parent: 'game',
   width: GAME_W,
   height: GAME_H,
-  backgroundColor: '#111827',
-  scale: {
-    mode: Phaser.Scale.FIT,
-    autoCenter: Phaser.Scale.CENTER_BOTH
-  },
-  render: {
-    antialias: true,
-    pixelArt: false
-  },
+  backgroundColor: '#dbe9c5',
+  scale: { mode: Phaser.Scale.FIT, autoCenter: Phaser.Scale.CENTER_BOTH },
+  render: { antialias: true, pixelArt: false },
   scene: [GameScene]
 });
